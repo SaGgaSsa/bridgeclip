@@ -9,7 +9,7 @@ const bundled = buildSync({
   stdin: {
     contents: `export { FormatStep, JobForm, parseTrimRange } from './src/renderer/components/JobForm';
       export { SetupCard } from './src/renderer/components/SetupCard';
-      export { useSettingsStore } from './src/renderer/store/use-settings-store';
+      export { useSettingsStore, deriveSetupState } from './src/renderer/store/use-settings-store';
       export { isValidSourceLink } from './src/renderer/components/SourcePicker';
       export { framingProblem, sourceAnalysisNotice } from './src/renderer/components/ClipList';
       export { parseJobOutput } from './src/shared/job-output';`,
@@ -29,13 +29,28 @@ const form = { exports: {} }
 new Function('module', 'exports', 'require', bundled)(form, form.exports, require)
 const { FormatStep, JobForm, isValidSourceLink, parseTrimRange, framingProblem, sourceAnalysisNotice, parseJobOutput } = form.exports
 
-test('setup needs only OpenRouter for clipping', () => {
-  const { SetupCard, useSettingsStore } = form.exports
-  useSettingsStore.setState({ openrouterConfigured: false })
-  const setup = renderToStaticMarkup(React.createElement(SetupCard, { onOpenSettings() {} }))
-  assert.match(setup, /OpenRouter/)
-  assert.doesNotMatch(setup, /ElevenLabs/)
-  useSettingsStore.setState({ openrouterConfigured: false, toolStatus: null })
+test('setup asks for OpenRouter only when a provider or AI vision needs it', () => {
+  const { SetupCard, deriveSetupState } = form.exports
+  const base = {
+    openrouterConfigured: false, transcriptionProvider: 'local', plannerProvider: 'opencode',
+    toolStatus: null, toolError: null, checkingTools: false,
+    aspectRatio: '9:16', layoutStyle: 'auto', layoutVision: false
+  }
+  assert.deepEqual(deriveSetupState(base).missingKeys, [])
+  assert.deepEqual(deriveSetupState({ ...base, transcriptionProvider: 'openrouter' }).missingKeys, ['OpenRouter'])
+  assert.deepEqual(deriveSetupState({ ...base, plannerProvider: 'openrouter' }).missingKeys, ['OpenRouter'])
+  assert.deepEqual(deriveSetupState({ ...base, layoutVision: true }).missingKeys, ['OpenRouter'])
+  assert.deepEqual(deriveSetupState({ ...base, aspectRatio: '16:9', layoutVision: true }).missingKeys, [])
+  assert.deepEqual(deriveSetupState({ ...base, transcriptionProvider: 'openrouter', openrouterConfigured: true }).missingKeys, [])
+  const tools = {
+    python: true, pythonDeps: true, ffmpeg: true, ffprobe: true, ytdlp: true,
+    fasterWhisper: false, opencode: true, engine: true, bridgeRunner: true
+  }
+  assert.equal(deriveSetupState({ ...base, toolStatus: tools }).toolsOk, false)
+  assert.equal(deriveSetupState({ ...base, transcriptionProvider: 'openrouter', toolStatus: tools }).toolsOk, true)
+  const keyless = renderToStaticMarkup(React.createElement(SetupCard, { onOpenSettings() {} }))
+  assert.doesNotMatch(keyless, /OpenRouter/)
+  assert.doesNotMatch(keyless, /ElevenLabs/)
 })
 
 test('source picker accepts full HTTP(S) links and rejects malformed or credentialed links', () => {

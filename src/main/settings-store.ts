@@ -3,6 +3,9 @@ import { closeSync, existsSync, fchmodSync, fsyncSync, mkdirSync, openSync, read
 import { isAbsolute, join } from 'path'
 import { randomUUID } from 'crypto'
 
+export type TranscriptionProvider = 'local' | 'openrouter'
+export type PlannerProvider = 'opencode' | 'openrouter'
+
 /**
  * BridgeClip is bring-your-own-key: every provider call is made from this
  * machine with the user's own keys. Keys are encrypted with the OS keychain
@@ -16,10 +19,22 @@ export interface AppSettings {
   pythonPath: string
   /** Names and jargon the speech-to-text should spell correctly, one per line. */
   customVocabulary: string
+  /** Speech-to-text provider: on-device faster-whisper or OpenRouter. */
+  transcriptionProvider: TranscriptionProvider
+  /** Clip planning provider: local OpenCode CLI or OpenRouter. */
+  plannerProvider: PlannerProvider
+  /** Exact OpenCode model id, no automatic substitution. */
+  opencodeModel: string
+  /** OpenCode CLI executable: `opencode` or a simple absolute path. */
+  opencodeCommand: string
+  /** faster-whisper model name or absolute model path. */
+  localWhisperModel: string
+  /** OpenCode CLI planning timeout, in seconds. */
+  opencodeTimeoutSeconds: number
 }
 
 export type ApiKeyName = 'openrouterApiKey' | 'zernioApiKey'
-export type PublicSettings = Pick<AppSettings, 'outputDirectory' | 'pythonPath' | 'customVocabulary'> & {
+export type PublicSettings = Pick<AppSettings, 'outputDirectory' | 'pythonPath' | 'customVocabulary' | 'transcriptionProvider' | 'plannerProvider' | 'opencodeModel' | 'opencodeCommand' | 'localWhisperModel' | 'opencodeTimeoutSeconds'> & {
   openrouterConfigured: boolean
   zernioConfigured: boolean
 }
@@ -27,15 +42,32 @@ export type PublicSettings = Pick<AppSettings, 'outputDirectory' | 'pythonPath' 
 const SECRET_KEYS = ['openrouterApiKey', 'zernioApiKey'] as const
 type SecretKey = (typeof SECRET_KEYS)[number]
 
+export const OPENCODE_DEFAULT_MODEL = 'opencode/muse-spark-1.3-contributor-free'
+export const OPENCODE_DEFAULT_COMMAND = 'opencode'
+export const DEFAULT_WHISPER_MODEL = 'small'
+export const DEFAULT_OPENCODE_TIMEOUT_SECONDS = 300
+
 const DEFAULT_SETTINGS: AppSettings = {
   openrouterApiKey: '',
   zernioApiKey: '',
   outputDirectory: join(app.getPath('home'), 'BridgeClip'),
   pythonPath: 'python3',
-  customVocabulary: ''
+  customVocabulary: '',
+  transcriptionProvider: 'local',
+  plannerProvider: 'opencode',
+  opencodeModel: OPENCODE_DEFAULT_MODEL,
+  opencodeCommand: OPENCODE_DEFAULT_COMMAND,
+  localWhisperModel: DEFAULT_WHISPER_MODEL,
+  opencodeTimeoutSeconds: DEFAULT_OPENCODE_TIMEOUT_SECONDS
 }
 
-const SETTINGS_VERSION = 7
+/** Pre-provider defaults: settings written before providers existed keep the legacy OpenRouter path. */
+const LEGACY_PROVIDERS: Pick<AppSettings, 'transcriptionProvider' | 'plannerProvider'> = {
+  transcriptionProvider: 'openrouter',
+  plannerProvider: 'openrouter'
+}
+
+const SETTINGS_VERSION = 8
 
 type PersistedSecret = { scheme: 'safeStorage' | 'base64'; value: string } | ''
 
@@ -46,6 +78,12 @@ interface PersistedSettings {
   outputDirectory: string
   pythonPath: string
   customVocabulary?: string
+  transcriptionProvider?: TranscriptionProvider
+  plannerProvider?: PlannerProvider
+  opencodeModel?: string
+  opencodeCommand?: string
+  localWhisperModel?: string
+  opencodeTimeoutSeconds?: number
 }
 
 function ensureDir(dir: string): string {
@@ -59,17 +97,72 @@ function getSettingsPath(): string {
   return join(ensureDir(app.getPath('userData')), 'settings.json')
 }
 
+/**
+ * Mirrors `is_safe_opencode_command` in bridge/bridge_runner.py: a simple
+ * executable name or absolute path, no shell metacharacters or extra args.
+ */
+function isSafeOpencodeCommand(value: string): boolean {
+  if (typeof value !== 'string' || !value || value.length > 512) return false
+  if (value.includes(String.fromCharCode(0))) return false
+  if (value.includes('\r') || value.includes('\n') || value.includes('\t')) return false
+  if (/[;&|$`'"<>() ]/.test(value)) return false
+  if (isAbsolute(value)) {
+    const base = value.replace(/[/\\]+/g, '/').split('/').pop() ?? ''
+    return base.length > 0 && /^[A-Za-z0-9_.-]+$/.test(base)
+  }
+  if (value.includes('/') || value.includes('\\')) return false
+  return /^[A-Za-z0-9_.-]+$/.test(value)
+}
+
+/**
+ * Mirrors `is_safe_opencode_model` in bridge/bridge_runner.py: a model id
+ * safe as an argv element for the resolved Windows `.cmd` launcher.
+ */
+function isSafeOpencodeModel(value: string): boolean {
+  if (typeof value !== 'string' || !value || value.length > 256) return false
+  if (value.includes(String.fromCharCode(0))) return false
+  if (value.includes('\r') || value.includes('\n') || value.includes('\t') || value.includes(' ')) return false
+  if (/["'&|<>()^%!`$;*?#~]/.test(value)) return false
+  return /^[A-Za-z0-9_.:/@+~-]+$/.test(value)
+}
+
 function normalizeSettings(settings: Partial<AppSettings>): AppSettings {
   if (!settings || typeof settings !== 'object') throw new Error('Invalid settings')
-  for (const key of Object.keys(DEFAULT_SETTINGS) as (keyof AppSettings)[]) {
-    if (settings[key] !== undefined && (typeof settings[key] !== 'string' || settings[key]!.length > 8192 || settings[key]!.includes('\0'))) throw new Error(`Invalid ${key}`)
+  for (const key of ['openrouterApiKey', 'zernioApiKey', 'outputDirectory', 'pythonPath', 'customVocabulary', 'opencodeModel', 'opencodeCommand', 'localWhisperModel'] as const) {
+    const value = settings[key]
+    if (value !== undefined && (typeof value !== 'string' || value.length > 8192 || value.includes(String.fromCharCode(0)))) throw new Error(`Invalid ${key}`)
   }
+  // Missing provider fields predate providers (version <= 7): keep the
+  // legacy OpenRouter path. Fresh installs never reach here (no file
+  // returns DEFAULT_SETTINGS directly). Coherent with bridge/config.py.
+  const transcriptionProvider = settings.transcriptionProvider === undefined
+    ? LEGACY_PROVIDERS.transcriptionProvider
+    : String(settings.transcriptionProvider).trim().toLowerCase()
+  if (transcriptionProvider !== 'local' && transcriptionProvider !== 'openrouter') throw new Error('Invalid transcriptionProvider')
+  const plannerProvider = settings.plannerProvider === undefined
+    ? LEGACY_PROVIDERS.plannerProvider
+    : String(settings.plannerProvider).trim().toLowerCase()
+  if (plannerProvider !== 'opencode' && plannerProvider !== 'openrouter') throw new Error('Invalid plannerProvider')
+  const opencodeModel = (settings.opencodeModel ?? DEFAULT_SETTINGS.opencodeModel).trim()
+  if (!isSafeOpencodeModel(opencodeModel)) throw new Error('Invalid opencodeModel')
+  const opencodeCommand = (settings.opencodeCommand ?? DEFAULT_SETTINGS.opencodeCommand).trim()
+  if (!isSafeOpencodeCommand(opencodeCommand)) throw new Error('Invalid opencodeCommand')
+  const localWhisperModel = (settings.localWhisperModel ?? DEFAULT_SETTINGS.localWhisperModel).trim()
+  if (!localWhisperModel || localWhisperModel.length > 512) throw new Error('Invalid localWhisperModel')
+  const opencodeTimeoutSeconds = settings.opencodeTimeoutSeconds ?? DEFAULT_SETTINGS.opencodeTimeoutSeconds
+  if (typeof opencodeTimeoutSeconds !== 'number' || !Number.isInteger(opencodeTimeoutSeconds) || opencodeTimeoutSeconds < 30 || opencodeTimeoutSeconds > 1200) throw new Error('Invalid opencodeTimeoutSeconds')
   const normalized: AppSettings = {
     openrouterApiKey: (settings.openrouterApiKey ?? DEFAULT_SETTINGS.openrouterApiKey).trim(),
     zernioApiKey: (settings.zernioApiKey ?? DEFAULT_SETTINGS.zernioApiKey).trim(),
     outputDirectory: (settings.outputDirectory || DEFAULT_SETTINGS.outputDirectory).trim(),
     pythonPath: (settings.pythonPath || DEFAULT_SETTINGS.pythonPath).trim(),
-    customVocabulary: vocabularyTerms(settings.customVocabulary ?? DEFAULT_SETTINGS.customVocabulary).join('\n')
+    customVocabulary: vocabularyTerms(settings.customVocabulary ?? DEFAULT_SETTINGS.customVocabulary).join('\n'),
+    transcriptionProvider,
+    plannerProvider,
+    opencodeModel,
+    opencodeCommand,
+    localWhisperModel,
+    opencodeTimeoutSeconds
   }
   normalized.outputDirectory ||= DEFAULT_SETTINGS.outputDirectory
   normalized.pythonPath ||= DEFAULT_SETTINGS.pythonPath
@@ -142,7 +235,13 @@ export function loadSettings(): AppSettings {
       ...secrets,
       outputDirectory: typeof raw.outputDirectory === 'string' ? raw.outputDirectory : DEFAULT_SETTINGS.outputDirectory,
       pythonPath: typeof raw.pythonPath === 'string' ? raw.pythonPath : DEFAULT_SETTINGS.pythonPath,
-      customVocabulary: typeof raw.customVocabulary === 'string' ? raw.customVocabulary : DEFAULT_SETTINGS.customVocabulary
+      customVocabulary: typeof raw.customVocabulary === 'string' ? raw.customVocabulary : DEFAULT_SETTINGS.customVocabulary,
+      transcriptionProvider: typeof raw.transcriptionProvider === 'string' ? raw.transcriptionProvider : undefined,
+      plannerProvider: typeof raw.plannerProvider === 'string' ? raw.plannerProvider : undefined,
+      opencodeModel: typeof raw.opencodeModel === 'string' ? raw.opencodeModel : undefined,
+      opencodeCommand: typeof raw.opencodeCommand === 'string' ? raw.opencodeCommand : undefined,
+      localWhisperModel: typeof raw.localWhisperModel === 'string' ? raw.localWhisperModel : undefined,
+      opencodeTimeoutSeconds: typeof raw.opencodeTimeoutSeconds === 'number' ? raw.opencodeTimeoutSeconds : undefined
     })
 
     if (needsMigration && canEncrypt()) writeSettings(settings)
@@ -162,7 +261,13 @@ function writeSettings(settings: AppSettings): void {
     zernioApiKey: encodeSecret(settings.zernioApiKey),
     outputDirectory: settings.outputDirectory,
     pythonPath: settings.pythonPath,
-    customVocabulary: settings.customVocabulary
+    customVocabulary: settings.customVocabulary,
+    transcriptionProvider: settings.transcriptionProvider,
+    plannerProvider: settings.plannerProvider,
+    opencodeModel: settings.opencodeModel,
+    opencodeCommand: settings.opencodeCommand,
+    localWhisperModel: settings.localWhisperModel,
+    opencodeTimeoutSeconds: settings.opencodeTimeoutSeconds
   }
 
   let fd: number | undefined
@@ -190,18 +295,30 @@ export function publicSettings(settings: AppSettings): PublicSettings {
     outputDirectory: settings.outputDirectory,
     pythonPath: settings.pythonPath,
     customVocabulary: settings.customVocabulary,
+    transcriptionProvider: settings.transcriptionProvider,
+    plannerProvider: settings.plannerProvider,
+    opencodeModel: settings.opencodeModel,
+    opencodeCommand: settings.opencodeCommand,
+    localWhisperModel: settings.localWhisperModel,
+    opencodeTimeoutSeconds: settings.opencodeTimeoutSeconds,
     openrouterConfigured: Boolean(settings.openrouterApiKey),
     zernioConfigured: Boolean(settings.zernioApiKey)
   }
 }
 
-export function savePublicSettings(update: Pick<PublicSettings, 'outputDirectory' | 'pythonPath' | 'customVocabulary'>): PublicSettings {
+export function savePublicSettings(update: Pick<PublicSettings, 'outputDirectory' | 'pythonPath' | 'customVocabulary' | 'transcriptionProvider' | 'plannerProvider' | 'opencodeModel' | 'opencodeCommand' | 'localWhisperModel' | 'opencodeTimeoutSeconds'>): PublicSettings {
   const current = loadSettings()
   return publicSettings(saveSettings({
     ...current,
     outputDirectory: update.outputDirectory,
     pythonPath: update.pythonPath,
-    customVocabulary: update.customVocabulary
+    customVocabulary: update.customVocabulary,
+    transcriptionProvider: update.transcriptionProvider,
+    plannerProvider: update.plannerProvider,
+    opencodeModel: update.opencodeModel,
+    opencodeCommand: update.opencodeCommand,
+    localWhisperModel: update.localWhisperModel,
+    opencodeTimeoutSeconds: update.opencodeTimeoutSeconds
   }))
 }
 
@@ -226,7 +343,7 @@ export function vocabularyTerms(value: string): string[] {
 }
 
 export function replaceApiKey(key: ApiKeyName, value: string): PublicSettings {
-  if (!SECRET_KEYS.includes(key) || typeof value !== 'string' || value.length > 8192 || value.includes('\0')) throw new Error('Invalid API key update')
+  if (!SECRET_KEYS.includes(key) || typeof value !== 'string' || value.length > 8192 || value.includes(String.fromCharCode(0))) throw new Error('Invalid API key update')
   const current = loadSettings()
   return publicSettings(saveSettings({ ...current, [key]: value.trim() }))
 }

@@ -6,6 +6,7 @@ import {
   getEnginePath,
   getBridgeRunnerPath,
   resolvePythonPath,
+  takeJobRuntimeSnapshot,
   validatePython,
   preflightCheck,
   type ClipJobConfig
@@ -17,7 +18,7 @@ import { assertAbsolutePath, assertMediaPath, assertTrustedSender, authorizeMedi
 import { assertPublicWebUrl } from './network-policy'
 import { validateJobConfig } from './validation'
 import { randomUUID } from 'crypto'
-import { resolveBinary, supportsCaptionFilter } from './tools'
+import { checkPythonModule, isOpencodeAvailable, resolveBinary, resolveOpencodeCommand, supportsCaptionFilter } from './tools'
 import { addAutomationContent, addLibraryClipsToAutomation, createAutomation, deleteAutomation, isAutomationMedia, listAutomations, removeAutomationContent, runAutomation, updateAutomation, updateAutomationContent } from './automations'
 import {
   cancelZernioConnect,
@@ -151,9 +152,24 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
     } catch (error) { return { error: error instanceof Error ? error.message : 'Invalid job options' } }
     const settings = loadSettings()
 
-    if (!settings.openrouterApiKey) {
+    // OpenRouter key only when a chosen provider or layout vision needs it.
+    // Fresh local installs (local transcription + opencode planner, vision
+    // off) must work keyless; migrated OpenRouter users keep their flow.
+    const needsOpenrouter =
+      settings.transcriptionProvider === 'openrouter' ||
+      settings.plannerProvider === 'openrouter' ||
+      config.layoutVision === true
+    if (needsOpenrouter && !settings.openrouterApiKey) {
       logger.warn('job.start.missingKey', { key: 'OPENROUTER_API_KEY' })
-      return { error: 'OpenRouter API key is required for AI clip planning. Go to Settings to add it.' }
+      if (config.layoutVision === true) {
+        return { error: 'AI layout vision needs an OpenRouter API key. Add one in Settings or turn layout vision off.' }
+      }
+      return { error: 'OpenRouter API key is required for the selected providers. Go to Settings to add it, or switch to the local providers.' }
+    }
+    // Local planner needs its CLI; fail fast instead of letting the engine report it mid-run.
+    if (settings.plannerProvider === 'opencode' && !isOpencodeAvailable(settings.opencodeCommand)) {
+      logger.warn('job.start.missingOpencode')
+      return { error: 'OpenCode CLI was not found. Check the OpenCode command in Settings or switch the planner provider.' }
     }
 
     const enginePath = getEnginePath()
@@ -190,15 +206,17 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
     ensureOutputDir(settings.outputDirectory)
 
     const jobId = randomUUID()
-    logger.info('job.start.request', { jobId, sourceType: isWebUrl(config.videoUrl) ? 'remote' : 'local', aspectRatio: config.aspectRatio })
+    // Freeze providers/output/key now: later settings changes must not alter this job.
+    const runtime = takeJobRuntimeSnapshot(settings)
+    logger.info('job.start.request', { jobId, sourceType: isWebUrl(config.videoUrl) ? 'remote' : 'local', aspectRatio: config.aspectRatio, transcriptionProvider: runtime.transcriptionProvider, plannerProvider: runtime.plannerProvider, layoutVision: config.layoutVision })
     try {
-      createRunRecord(settings.outputDirectory, jobId, config.videoUrl)
+      createRunRecord(runtime.outputDirectory, jobId, config.videoUrl)
     } catch {
-      try { finishRunRecord(settings.outputDirectory, jobId, 'failed', 'Could not start this run.') } catch { /* Output folder may be unavailable. */ }
+      try { finishRunRecord(runtime.outputDirectory, jobId, 'failed', 'Could not start this run.') } catch { /* Output folder may be unavailable. */ }
       return { error: 'Could not create the clipping run. Check the output folder and retry.' }
     }
     // Starts now when a slot is free; otherwise waits its turn in the queue.
-    const job = enqueueJob(jobId, config, settings.outputDirectory)
+    const job = enqueueJob(jobId, config, runtime.outputDirectory, runtime)
     return { jobId, queued: job.status === 'queued' }
   })
 
@@ -366,14 +384,25 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
       }
     }
 
-    const [pythonValidation, python, ffmpeg, ffmpegCaptions, ffprobe, ytdlp] = await Promise.all([
+    const [pythonValidation, python, ffmpeg, ffmpegCaptions, ffprobe, ytdlpBin, ytdlpModule, fasterWhisper] = await Promise.all([
       validatePython(resolvedPython, enginePath),
       check(resolvedPython),
       check(resolveBinary('ffmpeg'), '-version'),
       supportsCaptionFilter(),
       check(resolveBinary('ffprobe'), '-version'),
-      check(resolveBinary('yt-dlp'))
+      check(resolveBinary('yt-dlp')),
+      // yt-dlp ships as a Python module; the Windows installer has no executable.
+      checkPythonModule(resolvedPython, enginePath, 'yt_dlp'),
+      // Import only: never downloads a model or contacts a service.
+      settings.transcriptionProvider === 'local'
+        ? checkPythonModule(resolvedPython, enginePath, 'faster_whisper')
+        : Promise.resolve(true)
     ])
+
+    // OpenCode CLI resolved without a shell (handles .cmd via PATH search on Windows).
+    const opencodePath = resolveOpencodeCommand(settings.opencodeCommand)
+    // Only required when the opencode planner is selected; otherwise informational.
+    const opencode = settings.plannerProvider === 'opencode' ? opencodePath !== null : true
 
     const result = {
       python,
@@ -383,7 +412,13 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
       ffmpeg,
       ffmpegCaptions,
       ffprobe,
-      ytdlp,
+      ytdlp: ytdlpBin || ytdlpModule,
+      ytdlpModule,
+      fasterWhisper,
+      opencode,
+      opencodePath,
+      transcriptionProvider: settings.transcriptionProvider,
+      plannerProvider: settings.plannerProvider,
       engine: existsSync(join(enginePath, 'clip_engine', 'bridge_contract.py')),
       enginePath,
       bridgeRunner: existsSync(bridgePath),

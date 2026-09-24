@@ -332,7 +332,7 @@ export function FormatStep({ draft, update }: { draft: ClipDraft; update: Update
             <SettingRow
               className="mt-2"
               title="Check tricky shots with AI vision"
-              description="Checks uncertain shots. May add OpenRouter charges."
+              description="Checks uncertain shots with OpenRouter vision. Requires an OpenRouter key; may add OpenRouter charges."
               control={<Switch label="AI vision for smart framing" checked={draft.layoutVision} onChange={(layoutVision) => update({ layoutVision })} />}
             />
           )}
@@ -487,7 +487,7 @@ function ReviewStep({ draft, trim, onEdit }: {
           ? `${runningCount} jobs are running. This one waits in the queue and starts automatically.`
           : active.length > 0
             ? `Runs alongside ${active.length} other job${active.length === 1 ? '' : 's'}. Up to ${MAX_PARALLEL_JOBS} run at once.`
-            : 'Runs on this computer. Transcription and clip planning bill your OpenRouter account.'}
+            : 'Runs on this computer. OpenRouter providers and AI vision bill your OpenRouter account; OpenCode CLI planning may carry its own service cost.'}
       </p>
     </div>
   )

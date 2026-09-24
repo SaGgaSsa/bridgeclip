@@ -2,6 +2,16 @@ import { create } from 'zustand'
 import { errorMessage } from '../lib/utils'
 import { getApi } from '../lib/ipc'
 import type { ClipSettings, ToolStatus } from '../../preload/index'
+import { useDraftStore } from './use-draft-store'
+
+export const SETTINGS_DEFAULTS = {
+  transcriptionProvider: 'local',
+  plannerProvider: 'opencode',
+  opencodeModel: 'opencode/muse-spark-1.3-contributor-free',
+  opencodeCommand: 'opencode',
+  localWhisperModel: 'small',
+  opencodeTimeoutSeconds: 300
+} as const
 
 interface SettingsState extends ClipSettings {
   loaded: boolean
@@ -26,6 +36,12 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   outputDirectory: '',
   pythonPath: 'python3',
   customVocabulary: '',
+  transcriptionProvider: SETTINGS_DEFAULTS.transcriptionProvider,
+  plannerProvider: SETTINGS_DEFAULTS.plannerProvider,
+  opencodeModel: SETTINGS_DEFAULTS.opencodeModel,
+  opencodeCommand: SETTINGS_DEFAULTS.opencodeCommand,
+  localWhisperModel: SETTINGS_DEFAULTS.localWhisperModel,
+  opencodeTimeoutSeconds: SETTINGS_DEFAULTS.opencodeTimeoutSeconds,
   loaded: false,
   saving: false,
   toolStatus: null,
@@ -89,22 +105,63 @@ function pickSettings(s: ClipSettings): ClipSettings {
     zernioConfigured: s.zernioConfigured,
     outputDirectory: s.outputDirectory,
     pythonPath: s.pythonPath,
-    customVocabulary: s.customVocabulary
+    customVocabulary: s.customVocabulary,
+    transcriptionProvider: s.transcriptionProvider ?? SETTINGS_DEFAULTS.transcriptionProvider,
+    plannerProvider: s.plannerProvider ?? SETTINGS_DEFAULTS.plannerProvider,
+    opencodeModel: s.opencodeModel ?? SETTINGS_DEFAULTS.opencodeModel,
+    opencodeCommand: s.opencodeCommand ?? SETTINGS_DEFAULTS.opencodeCommand,
+    localWhisperModel: s.localWhisperModel ?? SETTINGS_DEFAULTS.localWhisperModel,
+    opencodeTimeoutSeconds: s.opencodeTimeoutSeconds ?? SETTINGS_DEFAULTS.opencodeTimeoutSeconds
   }
 }
 
 export type SetupState = { ready: boolean; missingKeys: string[]; toolsOk: boolean | null }
 
-/** Whether a clip job can start: the OpenRouter key is present and, once the
- *  system check has run, every required tool found. */
+export interface SetupInputs {
+  openrouterConfigured: boolean
+  transcriptionProvider: 'local' | 'openrouter'
+  plannerProvider: 'opencode' | 'openrouter'
+  toolStatus: ToolStatus | null
+  toolError: string | null
+  checkingTools: boolean
+  aspectRatio: string
+  layoutStyle: string
+  layoutVision: boolean
+}
+
+/** Pure setup derivation: OpenRouter key only when a chosen provider or the
+ *  current draft's AI layout vision (9:16 + auto + toggle) needs it. */
+export function deriveSetupState(inputs: SetupInputs): SetupState {
+  const visionActive = inputs.aspectRatio === '9:16' && inputs.layoutStyle === 'auto' && inputs.layoutVision === true
+  const needsOpenrouter =
+    inputs.transcriptionProvider === 'openrouter' || inputs.plannerProvider === 'openrouter' || visionActive
+  const missingKeys = [needsOpenrouter && !inputs.openrouterConfigured && 'OpenRouter'].filter(Boolean) as string[]
+  const toolsOk = inputs.toolError
+    ? false
+    : inputs.toolStatus
+      ? inputs.toolStatus.python &&
+        inputs.toolStatus.pythonDeps &&
+        inputs.toolStatus.ffmpeg &&
+        inputs.toolStatus.ffprobe &&
+        inputs.toolStatus.ytdlp &&
+        inputs.toolStatus.engine &&
+        inputs.toolStatus.bridgeRunner &&
+        (inputs.transcriptionProvider === 'local' ? inputs.toolStatus.fasterWhisper : true) &&
+        (inputs.plannerProvider === 'opencode' ? inputs.toolStatus.opencode : true)
+      : null
+  return { ready: missingKeys.length === 0 && toolsOk === true && !inputs.checkingTools, missingKeys, toolsOk }
+}
+
+/** Whether a clip job can start: keyless local path unless a provider or AI vision needs OpenRouter. */
 export function useSetupState(): SetupState {
-  const openrouter = useSettingsStore((s) => s.openrouterConfigured)
-  const tools = useSettingsStore((s) => s.toolStatus)
+  const openrouterConfigured = useSettingsStore((s) => s.openrouterConfigured)
+  const transcriptionProvider = useSettingsStore((s) => s.transcriptionProvider)
+  const plannerProvider = useSettingsStore((s) => s.plannerProvider)
+  const toolStatus = useSettingsStore((s) => s.toolStatus)
   const toolError = useSettingsStore((s) => s.toolError)
   const checkingTools = useSettingsStore((s) => s.checkingTools)
-  const missingKeys = [!openrouter && 'OpenRouter'].filter(Boolean) as string[]
-  const toolsOk = toolError ? false : tools
-    ? tools.python && tools.pythonDeps && tools.ffmpeg && tools.ffprobe && tools.ytdlp && tools.engine && tools.bridgeRunner
-    : null
-  return { ready: missingKeys.length === 0 && toolsOk === true && !checkingTools, missingKeys, toolsOk }
+  const aspectRatio = useDraftStore((s) => s.aspectRatio)
+  const layoutStyle = useDraftStore((s) => s.layoutStyle)
+  const layoutVision = useDraftStore((s) => s.layoutVision)
+  return deriveSetupState({ openrouterConfigured, transcriptionProvider, plannerProvider, toolStatus, toolError, checkingTools, aspectRatio, layoutStyle, layoutVision })
 }

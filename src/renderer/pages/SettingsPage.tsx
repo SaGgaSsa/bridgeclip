@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { ArrowUpRight, BookA, Check, ChevronDown, Cpu, FolderOpen, Github, Info, KeyRound, Loader2, RefreshCw, ScrollText } from 'lucide-react'
+import { ArrowUpRight, BookA, Check, ChevronDown, Cpu, FolderOpen, Github, Info, KeyRound, Loader2, RefreshCw, ScrollText, Sparkles } from 'lucide-react'
 import { useSettingsStore } from '../store/use-settings-store'
+import { useDraftStore } from '../store/use-draft-store'
 import { useApiKeyDrafts } from '../hooks/use-api-key-drafts'
 import { getApi } from '../lib/ipc'
 import { cn, errorMessage } from '../lib/utils'
@@ -12,17 +13,20 @@ import { Page } from '../components/ui/Page'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Panel, PanelHeader } from '../components/ui/Panel'
 import { Button } from '../components/ui/Button'
-import { Field, TextArea, TextInput } from '../components/ui/Field'
+import { Field, Select, TextArea, TextInput } from '../components/ui/Field'
 import { Badge, StatusDot } from '../components/ui/Badge'
 import { IconTile } from '../components/ui/IconTile'
 import { Callout } from '../components/ui/Callout'
 
-type SectionId = 'keys' | 'vocabulary' | 'output' | 'system' | 'about'
+type SectionId = 'keys' | 'providers' | 'vocabulary' | 'output' | 'system' | 'about'
 type SectionTone = 'success' | 'warning' | 'danger' | 'idle'
 
 export function SettingsPage(): React.JSX.Element {
-  const { outputDirectory, pythonPath, customVocabulary, openrouterConfigured, zernioConfigured, saving, save, toolStatus, toolError, checkTools, checkingTools } =
+  const { outputDirectory, pythonPath, customVocabulary, openrouterConfigured, zernioConfigured, transcriptionProvider, plannerProvider, opencodeModel, opencodeCommand, localWhisperModel, opencodeTimeoutSeconds, saving, save, toolStatus, toolError, checkTools, checkingTools } =
     useSettingsStore()
+  const draftAspect = useDraftStore((s) => s.aspectRatio)
+  const draftLayout = useDraftStore((s) => s.layoutStyle)
+  const draftVision = useDraftStore((s) => s.layoutVision)
   const keys = useApiKeyDrafts()
   const [isPackaged, setIsPackaged] = useState(true)
   const [savedAt, setSavedAt] = useState<number | null>(null)
@@ -45,14 +49,17 @@ export function SettingsPage(): React.JSX.Element {
 
   const lastSaved = Math.max(savedAt ?? 0, keys.savedAt ?? 0)
   const error = saveError ?? keys.error
-  const tools = toolRows(toolStatus)
+  const visionActive = draftAspect === '9:16' && draftLayout === 'auto' && draftVision === true
+  const needsOpenrouterKey = transcriptionProvider === 'openrouter' || plannerProvider === 'openrouter' || visionActive
+  const tools = toolRows(toolStatus, transcriptionProvider, plannerProvider)
   const toolsChecked = tools.every((row) => row.ok != null)
   const toolsMissing = tools.filter((row) => !row.optional && row.ok === false).length
-  const keysMissing = Number(!openrouterConfigured)
+  const keysMissing = needsOpenrouterKey && !openrouterConfigured ? 1 : 0
   const vocabularyTerms = customVocabulary.split('\n').filter((line) => line.trim()).length
 
   const sections: { id: SectionId; label: string; icon: ReactNode; tone: SectionTone }[] = [
     { id: 'keys', label: 'API keys', icon: <KeyRound />, tone: keysMissing ? 'warning' : 'success' },
+    { id: 'providers', label: 'Providers', icon: <Sparkles />, tone: 'idle' },
     { id: 'vocabulary', label: 'Vocabulary', icon: <BookA />, tone: 'idle' },
     { id: 'output', label: 'Output', icon: <FolderOpen />, tone: 'idle' },
     { id: 'system', label: 'System check', icon: <Cpu />, tone: !toolsChecked ? 'idle' : toolsMissing ? 'danger' : 'success' },
@@ -62,7 +69,7 @@ export function SettingsPage(): React.JSX.Element {
   const jump = (id: SectionId): void => document.getElementById(`settings-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 
   const checks: { label: string; ok: boolean | null; detail: string; section: SectionId; optional?: boolean; tone?: 'danger' }[] = [
-    { label: 'OpenRouter', ok: openrouterConfigured, detail: openrouterConfigured ? 'Key saved' : 'Needed to transcribe and pick clips', section: 'keys' },
+    { label: 'OpenRouter', ok: openrouterConfigured ? true : needsOpenrouterKey ? false : true, detail: openrouterConfigured ? 'Key saved' : needsOpenrouterKey ? 'Needed for the selected providers or AI vision' : 'Optional for the local path', section: 'keys', optional: !needsOpenrouterKey },
     { label: 'Tools', ok: toolsChecked ? toolsMissing === 0 : null, detail: !toolsChecked ? (checkingTools ? 'Checking…' : 'Not checked') : toolsMissing ? `${toolsMissing} missing` : 'All installed', section: 'system', tone: 'danger' },
     { label: 'Zernio', ok: zernioConfigured, detail: zernioConfigured ? 'Posting on' : 'Optional, for posting', section: 'keys', optional: true }
   ]
@@ -104,7 +111,7 @@ export function SettingsPage(): React.JSX.Element {
                 <IconTile tone={blocking ? 'warning' : 'success'} size="lg">{blocking ? <KeyRound /> : <Check strokeWidth={3} />}</IconTile>
                 <div>
                   <h2 className="text-sm font-semibold text-ink">{blocking ? `${blocking} thing${blocking === 1 ? '' : 's'} to set up before clipping` : 'Ready to clip'}</h2>
-                  <p className="mt-0.5 text-xs text-ink-muted">{APP_NAME} runs on this computer. One OpenRouter key covers transcription and clip selection.</p>
+                  <p className="mt-0.5 text-xs text-ink-muted">{APP_NAME} runs on this computer. Local transcription + OpenCode planning work without a key; OpenRouter providers or AI vision need an OpenRouter key.</p>
                 </div>
               </div>
             </div>
@@ -142,7 +149,7 @@ export function SettingsPage(): React.JSX.Element {
                   onRemove={() => void keys.remove('openrouterApiKey')}
                   onBlur={() => void keys.persist()}
                   placeholder="sk-or-…"
-                  description="Transcribes with MAI Transcribe 2 and picks the moments worth clipping."
+                  description="Needed for OpenRouter transcription, OpenRouter planning, and AI layout vision. Optional when transcription is local, the planner is OpenCode, and vision is off."
                   getKeyUrl={PROVIDER_LINKS.openrouter}
                 />
               </KeyRow>
@@ -160,6 +167,65 @@ export function SettingsPage(): React.JSX.Element {
                   getKeyUrl={PROVIDER_LINKS.zernio}
                 />
               </KeyRow>
+            </div>
+          </Section>
+
+          <Section id="providers">
+            <PanelHeader
+              icon={<IconTile tone="accent"><Sparkles /></IconTile>}
+              title="Providers"
+              description="Local transcription with OpenCode planning works without an OpenRouter key. Zernio stays separate, only for posting."
+            />
+            <div className="mt-4 grid gap-4">
+              <Field label="Transcription" hint={transcriptionProvider === 'local' ? 'On-device faster-whisper. Model weights download once.' : 'OpenRouter transcription needs an OpenRouter key.'}>
+                <Select
+                  aria-label="Transcription provider"
+                  value={transcriptionProvider}
+                  onChange={(e) => void commit({ transcriptionProvider: e.target.value as 'local' | 'openrouter' }, true)}
+                >
+                  <option value="local">Local (faster-whisper)</option>
+                  <option value="openrouter">OpenRouter</option>
+                </Select>
+              </Field>
+              <Field label="Planner" hint={plannerProvider === 'opencode' ? 'OpenCode CLI plans clips on this computer.' : 'OpenRouter planning needs an OpenRouter key.'}>
+                <Select
+                  aria-label="Planner provider"
+                  value={plannerProvider}
+                  onChange={(e) => void commit({ plannerProvider: e.target.value as 'opencode' | 'openrouter' }, true)}
+                >
+                  <option value="opencode">OpenCode CLI</option>
+                  <option value="openrouter">OpenRouter</option>
+                </Select>
+              </Field>
+              {transcriptionProvider === 'local' && (
+                <DevPathField
+                  label="Whisper model"
+                  value={localWhisperModel}
+                  placeholder="small"
+                  onCommit={(v) => void commit({ localWhisperModel: v }, true)}
+                />
+              )}
+              {plannerProvider === 'opencode' && (
+                <>
+                  <Callout tone="warning">OpenCode CLI requires login and may send clip text to its service. Its service cost is unknown and is not covered by any estimate shown here.</Callout>
+                  <DevPathField
+                    label="OpenCode model"
+                    value={opencodeModel}
+                    placeholder="opencode/muse-spark-1.3-contributor-free"
+                    onCommit={(v) => void commit({ opencodeModel: v })}
+                  />
+                  <DevPathField
+                    label="OpenCode command"
+                    value={opencodeCommand}
+                    placeholder="opencode"
+                    onCommit={(v) => void commit({ opencodeCommand: v }, true)}
+                  />
+                  <TimeoutField
+                    value={opencodeTimeoutSeconds}
+                    onCommit={(v) => void commit({ opencodeTimeoutSeconds: v })}
+                  />
+                </>
+              )}
             </div>
           </Section>
 
@@ -417,9 +483,37 @@ function DevPathField({
   )
 }
 
+function TimeoutField({ value, onCommit }: { value: number; onCommit: (value: number) => void }): React.JSX.Element {
+  const [draft, setDraft] = useState(String(value))
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => setDraft(String(value)), [value])
+  return (
+    <Field label="OpenCode timeout (seconds)" hint="30–1200 seconds">
+      <TextInput
+        mono
+        inputMode="numeric"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => {
+          const n = parseInt(draft.trim(), 10)
+          if (!Number.isInteger(n) || n < 30 || n > 1200) {
+            setError('Use a whole number between 30 and 1200.')
+            return
+          }
+          setError(null)
+          if (n !== value) onCommit(n)
+        }}
+        onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+        aria-label="OpenCode timeout in seconds"
+      />
+      {error && <p role="alert" className="mt-1 text-xs text-danger">{error}</p>}
+    </Field>
+  )
+}
+
 interface ToolRow { name: string; ok: boolean | null; detail?: ReactNode; optional?: boolean }
 
-function toolRows(status: ToolStatus | null): ToolRow[] {
+function toolRows(status: ToolStatus | null, transcriptionProvider: 'local' | 'openrouter', plannerProvider: 'opencode' | 'openrouter'): ToolRow[] {
   return [
     { name: 'Python', ok: status?.python ?? null, detail: status?.pythonPath },
     {
@@ -436,6 +530,18 @@ function toolRows(status: ToolStatus | null): ToolRow[] {
     },
     { name: 'FFprobe', ok: status?.ffprobe ?? null },
     { name: 'yt-dlp', ok: status?.ytdlp ?? null, detail: 'Downloads YouTube videos' },
+    {
+      name: 'Local transcription (faster-whisper)',
+      ok: status?.fasterWhisper ?? null,
+      detail: transcriptionProvider === 'local' ? 'Required for local transcription' : 'Only used for local transcription',
+      optional: transcriptionProvider !== 'local'
+    },
+    {
+      name: 'OpenCode CLI',
+      ok: status?.opencode ?? null,
+      detail: status?.opencodePath ?? (plannerProvider === 'opencode' ? 'Required for OpenCode planning' : 'Only used for OpenCode planning'),
+      optional: plannerProvider !== 'opencode'
+    },
     { name: 'BridgeClip clipping engine', ok: status?.engine ?? null, detail: status?.enginePath },
     { name: 'Bridge runner', ok: status?.bridgeRunner ?? null, detail: status?.bridgePath }
   ]

@@ -585,43 +585,13 @@ class AIClippingPipeline:
             capture_memory("before_manifest_upload")
 
             # Build API cost breakdown
-            api_costs: dict[str, Any] = {}
-            total_cost = 0.0
+            api_costs = self._build_api_costs(transcription_result, clip_plan, layout_vision_cost)
+            total_cost = api_costs["total_estimated_cost_usd"]
 
-            if transcription_result.api_costs:
-                tc = transcription_result.api_costs
-                api_costs["transcription"] = {
-                    "provider": tc.provider,
-                    "model": tc.model,
-                    "audio_duration_seconds": round(tc.audio_duration_seconds, 1),
-                    "estimated_cost_usd": tc.estimated_cost_usd,
-                }
-                total_cost += tc.estimated_cost_usd
-
-            if clip_plan.api_costs:
-                pc = clip_plan.api_costs
-                api_costs["planning"] = {
-                    "provider": pc.provider,
-                    "model": pc.model,
-                    "prompt_tokens": pc.prompt_tokens,
-                    "completion_tokens": pc.completion_tokens,
-                    "total_tokens": pc.total_tokens,
-                    "estimated_cost_usd": pc.estimated_cost_usd,
-                    "attempts": pc.attempts,
-                }
-                total_cost += pc.estimated_cost_usd
-
-            if layout_vision_cost:
-                api_costs["layout_vision"] = {
-                    "provider": "openrouter",
-                    "model": self.settings.layout_vision_model,
-                    "estimated_cost_usd": round(layout_vision_cost, 6),
-                }
-                total_cost += layout_vision_cost
-
-            api_costs["total_estimated_cost_usd"] = round(total_cost, 6)
-
-            logger.info(f"Job {job_id} total API cost: ${total_cost:.6f}")
+            if total_cost is None:
+                logger.info(f"Job {job_id} total API cost: unknown (unbilled component present)")
+            else:
+                logger.info(f"Job {job_id} total API cost: ${total_cost:.6f}")
 
             metrics = {
                 "requested_settings": {
@@ -857,6 +827,63 @@ class AIClippingPipeline:
             ))
 
         return artifacts
+
+    def _build_api_costs(
+        self,
+        transcription_result: TranscriptionResult,
+        clip_plan: ClipPlanResponse,
+        layout_vision_cost: float,
+    ) -> dict[str, Any]:
+        """API cost breakdown with a null total when any component is unknown.
+
+        OpenCode CLI planning reports no cost (provider/model billing is not
+        visible), so its `estimated_cost_usd` is None and the summed total
+        must be None too — never a misleading $0. Numeric components
+        (OpenRouter usage, known-free local transcription at $0) are preserved.
+        """
+        api_costs: dict[str, Any] = {}
+        total_cost: Optional[float] = 0.0
+
+        def _add(cost: Optional[float]) -> None:
+            nonlocal total_cost
+            if cost is None:
+                total_cost = None
+            elif total_cost is not None:
+                total_cost += cost
+
+        if transcription_result.api_costs:
+            tc = transcription_result.api_costs
+            api_costs["transcription"] = {
+                "provider": tc.provider,
+                "model": tc.model,
+                "audio_duration_seconds": round(tc.audio_duration_seconds, 1),
+                "estimated_cost_usd": tc.estimated_cost_usd,
+            }
+            _add(tc.estimated_cost_usd)
+
+        if clip_plan.api_costs:
+            pc = clip_plan.api_costs
+            api_costs["planning"] = {
+                "provider": pc.provider,
+                "model": pc.model,
+                "prompt_tokens": pc.prompt_tokens,
+                "completion_tokens": pc.completion_tokens,
+                "total_tokens": pc.total_tokens,
+                "estimated_cost_usd": pc.estimated_cost_usd,
+                "attempts": pc.attempts,
+            }
+            _add(pc.estimated_cost_usd)
+
+        if layout_vision_cost:
+            api_costs["layout_vision"] = {
+                "provider": "openrouter",
+                "model": self.settings.layout_vision_model,
+                "estimated_cost_usd": round(layout_vision_cost, 6),
+            }
+            _add(layout_vision_cost)
+
+        api_costs["total_estimated_cost_usd"] = round(total_cost, 6) if total_cost is not None else None
+        return api_costs
 
     @staticmethod
     def _chapter_dicts(segment: ClipPlanSegment) -> Optional[list[dict]]:

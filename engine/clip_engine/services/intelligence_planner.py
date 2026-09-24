@@ -67,14 +67,18 @@ class ClipPlanSegment:
 
 @dataclass
 class PlanningApiCosts:
-    """Cost tracking for OpenRouter API calls during clip planning."""
+    """Cost tracking for OpenRouter API calls during clip planning.
+
+    `estimated_cost_usd` is None when the cost is unknown, which is the case
+    for the OpenCode CLI path (provider/model billing is not reported).
+    """
 
     provider: str = "openrouter"
     model: str = ""
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
-    estimated_cost_usd: float = 0.0
+    estimated_cost_usd: Optional[float] = 0.0
     attempts: int = 0
 
 
@@ -222,11 +226,12 @@ class IntelligencePlannerService:
     - Automatic clip count scaling based on video duration
     """
 
-    def __init__(self):
-        self.settings = get_settings()
+    def __init__(self, settings=None):
+        self.settings = settings or get_settings()
         self._http_client: Optional[httpx.AsyncClient] = None
-        
-        if not self.settings.openrouter_api_key:
+
+        provider = str(getattr(self.settings, "planner_provider", "openrouter") or "openrouter").lower()
+        if provider == "openrouter" and not self.settings.openrouter_api_key:
             logger.warning("OPENROUTER_API_KEY not set, intelligence planning will fail")
 
     def calculate_optimal_clip_count(
@@ -509,7 +514,20 @@ class IntelligencePlannerService:
         self._current_transcript = transcript
         metadata_duration = getattr(video_metadata, "duration_seconds", None)
         self._current_video_duration = float(metadata_duration) if metadata_duration is not None else None
-        
+        self._current_visual_frame_times = []
+
+        planner_provider = str(getattr(self.settings, "planner_provider", "openrouter") or "openrouter").lower()
+        if planner_provider == "opencode":
+            return await self._plan_via_opencode(
+                transcript=transcript,
+                target_platform=target_platform,
+                clip_count=clip_count,
+                min_duration_seconds=min_duration_seconds,
+                max_duration_seconds=max_duration_seconds,
+                duration_ranges=duration_ranges,
+                longform=longform,
+            )
+
         # Build prompts
         system_prompt = (
             self._build_longform_system_prompt(clip_count, min_duration_seconds, max_duration_seconds)
@@ -994,6 +1012,61 @@ Do not overlap clips by more than 5 seconds."""
             return await chat_completion(client, payload)
         except OpenRouterError as e:
             raise IntelligencePlanningError(str(e), retryable=e.retryable) from e
+
+    async def _plan_via_opencode(
+        self,
+        transcript: list,
+        target_platform: str,
+        clip_count: int,
+        min_duration_seconds: int,
+        max_duration_seconds: int,
+        duration_ranges: Optional[list[str]],
+        longform: bool,
+    ) -> ClipPlanResponse:
+        """Plan clips with the OpenCode CLI, reusing parse/finalize logic."""
+        from clip_engine.services.opencode_planner import (
+            LOCAL_NO_TRANSCRIPT_MESSAGE,
+            OpenCodePlannerError,
+            build_opencode_prompt,
+            run_opencode_prompt,
+        )
+
+        if not transcript:
+            raise IntelligencePlanningError(LOCAL_NO_TRANSCRIPT_MESSAGE)
+        system_prompt = (
+            self._build_longform_system_prompt(clip_count, min_duration_seconds, max_duration_seconds)
+            if longform
+            else self._build_system_prompt(
+                clip_count, min_duration_seconds, max_duration_seconds, duration_ranges
+            )
+        )
+        transcript_text = self._build_transcript_text(transcript)
+        logger.info("OpenCode transcript text length: %s chars", len(transcript_text))
+        prompt_text = build_opencode_prompt(
+            system_prompt, transcript_text, clip_count,
+            min_duration_seconds, max_duration_seconds, longform,
+        )
+        model = getattr(self.settings, "opencode_model", "opencode/muse-spark-1.3-contributor-free")
+        command = getattr(self.settings, "opencode_command", "opencode")
+        timeout = getattr(self.settings, "opencode_timeout_seconds", 300)
+        try:
+            answer_json = await run_opencode_prompt(
+                prompt_text, model=model, command=command, timeout_seconds=timeout,
+            )
+        except OpenCodePlannerError as e:
+            raise IntelligencePlanningError(str(e), retryable=getattr(e, "retryable", False)) from e
+        result = self._parse_clip_plan_response(
+            {"choices": [{"message": {"content": answer_json}, "finish_reason": "stop"}]}
+        )
+        result.segments = self._finalize_clips(result.segments, clip_count)
+        result.total_clips = len(result.segments)
+        # The CLI provider/model cost is unknown: report None so totals do
+        # not collapse to a misleading $0 (see _build_api_costs).
+        result.api_costs = PlanningApiCosts(
+            provider="opencode", model=model, prompt_tokens=0,
+            completion_tokens=0, total_tokens=0, estimated_cost_usd=None, attempts=1,
+        )
+        return result
 
     def _parse_clip_plan_response(self, response: dict) -> ClipPlanResponse:
         """Parse OpenRouter response into ClipPlanResponse."""

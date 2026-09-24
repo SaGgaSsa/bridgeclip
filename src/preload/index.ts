@@ -19,6 +19,12 @@ export interface ClipSettings {
   outputDirectory: string
   pythonPath: string
   customVocabulary: string
+  transcriptionProvider: 'local' | 'openrouter'
+  plannerProvider: 'opencode' | 'openrouter'
+  opencodeModel: string
+  opencodeCommand: string
+  localWhisperModel: string
+  opencodeTimeoutSeconds: number
 }
 
 export type { ClipJobRequest, JobSnapshot } from '../shared/jobs'
@@ -45,6 +51,16 @@ export interface ToolStatus {
   ffmpegCaptions: boolean
   ffprobe: boolean
   ytdlp: boolean
+  /** yt-dlp importable as a Python module (Windows installer has no executable). */
+  ytdlpModule: boolean
+  /** faster-whisper importable; true when the local transcriber is not selected. */
+  fasterWhisper: boolean
+  /** OpenCode CLI resolvable; true when the opencode planner is not selected. */
+  opencode: boolean
+  /** Resolved OpenCode executable path, null when not found. */
+  opencodePath: string | null
+  transcriptionProvider: 'local' | 'openrouter'
+  plannerProvider: 'opencode' | 'openrouter'
   engine: boolean
   enginePath: string
   bridgeRunner: boolean

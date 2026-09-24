@@ -14,6 +14,60 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
 
+TRANSCRIPTION_PROVIDERS = ("openrouter", "local")
+PLANNER_PROVIDERS = ("openrouter", "opencode")
+OPENCODE_DEFAULT_MODEL = "opencode/muse-spark-1.3-contributor-free"
+OPENCODE_DEFAULT_COMMAND = "opencode"
+
+_SIMPLE_COMMAND_RE = None  # compiled lazily to keep import light
+
+
+def is_safe_opencode_command(value: str) -> bool:
+    """Simple executable name or absolute path, with no shell or extra args.
+
+    Accepts ``opencode`` / ``opencode.exe`` style names, or an absolute path
+    whose basename is safe. Rejects spaces, quotes, shell metacharacters and
+    relative paths with separators so the CLI is never run through a shell
+    with arbitrary arguments.
+    """
+    import os as _os
+    import re as _re
+
+    if not isinstance(value, str) or not value or len(value) > 512:
+        return False
+    if any(c in value for c in ("\0", "\n", "\r", ";", "&", "|", "$", "`", "'", '"', "<", ">", "(", ")")):
+        return False
+    if " " in value or "\t" in value:
+        return False
+    if _os.path.isabs(value):
+        base = value.replace("/", _os.sep).split(_os.sep)[-1]
+        if not base:
+            return False
+        return bool(_re.fullmatch(r"[A-Za-z0-9_.-]+", base))
+    # Simple executable: no directory separators at all.
+    if "/" in value or "\\" in value:
+        return False
+    return bool(_re.fullmatch(r"[A-Za-z0-9_.-]+", value))
+
+
+def is_safe_opencode_model(value: str) -> bool:
+    """Model id safe to pass as an argv element to the CLI.
+
+    The resolved Windows launcher is a ``.cmd`` file, so besides whitespace
+    the value must not contain ``cmd.exe`` metacharacters (``&|<>()^%!"'``
+    and friends) that could escape the ``--model`` argument. Plain model ids
+    such as ``opencode/muse-spark-1.3-contributor-free`` pass; anything with
+    spaces, quotes or shell metacharacters is rejected. No substitution or
+    normalization is applied: the exact value is forwarded.
+    """
+    import re as _re
+
+    if not isinstance(value, str) or not value or len(value) > 256 or "\0" in value:
+        return False
+    if any(c in value for c in (" ", "\t", "\n", "\r", '"', "'", "&", "|", "<", ">", "(", ")", "^", "%", "!", "`", "$", ";", "*", "?", "#", "~")):
+        return False
+    return bool(_re.fullmatch(r"[A-Za-z0-9_.:/@+~-]+", value))
+
 
 # ============================================================
 # ASPECT RATIO PRESETS
@@ -662,6 +716,73 @@ class Settings(BaseSettings):
     # Transcription through OpenRouter (MAI Transcribe 2)
     transcription_diarize: bool = True
 
+    # Local engine providers. Defaults preserve the legacy OpenRouter path
+    # (bridge contract 1). Bridge sets these from validated job config via
+    # TRANSCRIPTION_PROVIDER / PLANNER_PROVIDER before settings are cached.
+    transcription_provider: str = "openrouter"
+    planner_provider: str = "openrouter"
+    # faster-whisper model name or absolute model path (CPU int8 by default).
+    local_whisper_model: str = "small"
+    # OpenCode CLI planner. Exact model, no automatic substitution.
+    opencode_model: str = OPENCODE_DEFAULT_MODEL
+    opencode_command: str = OPENCODE_DEFAULT_COMMAND
+    opencode_timeout_seconds: int = 300
+
+    @field_validator("transcription_provider")
+    @classmethod
+    def _validate_transcription_provider(cls, value: str) -> str:
+        provider = value.strip().lower() if isinstance(value, str) else ""
+        if provider not in TRANSCRIPTION_PROVIDERS:
+            raise ValueError(f"TRANSCRIPTION_PROVIDER must be one of {', '.join(TRANSCRIPTION_PROVIDERS)}")
+        return provider
+
+    @field_validator("planner_provider")
+    @classmethod
+    def _validate_planner_provider(cls, value: str) -> str:
+        provider = value.strip().lower() if isinstance(value, str) else ""
+        if provider not in PLANNER_PROVIDERS:
+            raise ValueError(f"PLANNER_PROVIDER must be one of {', '.join(PLANNER_PROVIDERS)}")
+        return provider
+
+    @field_validator("local_whisper_model")
+    @classmethod
+    def _validate_whisper_model(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip() or len(value) > 512 or "\0" in value:
+            raise ValueError("LOCAL_WHISPER_MODEL must be a non-empty model name or path")
+        return value.strip()
+
+    @field_validator("opencode_model")
+    @classmethod
+    def _validate_opencode_model(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("OPENCODE_MODEL must be a non-empty model id")
+        model = value.strip()
+        if not is_safe_opencode_model(model):
+            raise ValueError("OPENCODE_MODEL must be a plain model id without whitespace or shell metacharacters")
+        return model
+
+    @field_validator("opencode_command")
+    @classmethod
+    def _validate_opencode_command(cls, value: str) -> str:
+        if not is_safe_opencode_command(value):
+            raise ValueError("OPENCODE_COMMAND must be a simple executable name or absolute path")
+        return value
+
+    @field_validator("opencode_timeout_seconds")
+    @classmethod
+    def _validate_opencode_timeout(cls, value: int) -> int:
+        if type(value) is not int or not 30 <= value <= 1200:
+            raise ValueError("OPENCODE_TIMEOUT_SECONDS must be between 30 and 1200")
+        return value
+
+    def needs_openrouter_key(self) -> bool:
+        """True when any chosen provider or layout vision needs OpenRouter."""
+        return (
+            self.transcription_provider == "openrouter"
+            or self.planner_provider == "openrouter"
+            or bool(self.layout_vision_enabled)
+        )
+
     @field_validator("planner_reasoning_effort", "layout_vision_reasoning_effort")
     @classmethod
     def _validate_reasoning_effort(cls, value: str, info) -> str:
@@ -789,11 +910,7 @@ class Settings(BaseSettings):
     def max_download_duration_seconds(self) -> int:
         return 21600  # 6 hours max (credit-guarded in API)
 
-    # Transcription uses the same OpenRouter key as planning.
-    @property
-    def transcription_provider(self) -> str:
-        return "openrouter"
-
+    # Transcription uses the same OpenRouter key as planning (legacy path).
     @property
     def transcription_model(self) -> str:
         return "microsoft/mai-transcribe-2"

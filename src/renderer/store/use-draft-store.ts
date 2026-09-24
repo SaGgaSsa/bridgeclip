@@ -50,7 +50,7 @@ export const useDraftStore = create<DraftState>((set) => ({
   source: '',
   aspectRatio: '9:16',
   layoutStyle: 'auto',
-  layoutVision: true,
+  layoutVision: false,
   pacing: 'tight',
   durations: ['short'],
   autoClipCount: true,

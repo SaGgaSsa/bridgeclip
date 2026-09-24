@@ -74,6 +74,25 @@ npm ci
 npm run dev
 ```
 
+### Windows 10/11 (run from source)
+
+Windows source builds are experimental; run them from source with `npm run dev`. Windows distributable packaging (NSIS) is not verified, and resource staging is currently macOS-only.
+
+**Prerequisites (x64):** Python 3.12, FFmpeg and FFprobe with the libass-backed `ass` filter (for example a full build from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) or [BtbN](https://github.com/BtbN/FFmpeg-Builds)) on `PATH`, Node.js 22, and the [OpenCode CLI](https://opencode.ai/) signed in with an available model for the default local planner.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1
+# or: npm run setup:windows
+```
+
+The script creates or reuses `engine\.venv` (an existing venv must report Python 3.12.x), installs `engine/requirements.lock` with `pip --require-hashes`, runs `npm ci` from the Node lockfile, verifies the `ass` filter via `ffmpeg -filters`, and then prints the next steps. It never stores API keys. End result after `npm run dev`:
+
+- Dev Python path: `engine\.venv\Scripts\python.exe` (also detected automatically; check **Settings → System check**).
+- Faster-Whisper downloads its model weights on first local transcription; nothing is pre-downloaded by setup.
+- OpenCode must be logged in with an available model. OpenRouter planning and transcription remain available in Settings.
+- Local transcription does not mean transcript text stays on this PC: the default OpenCode planner may send that text to its configured service.
+- Finished clips are vertical MP4 files, same as other BridgeClip builds.
+
 BridgeClip finds its in-repo engine and virtual environment automatically. **Settings → System check** shows the Python, yt-dlp, FFmpeg, and engine checks; set **Python path** in development if you use another interpreter.
 
 The release workflow packages the in-repo engine and media tools into signed macOS builds. For local packaging, first run `bash scripts/prepare-resources.sh arm64` (or `x64` on Intel), then follow [the release guide](docs/RELEASING.md). Signing credentials are still required for a distributable build.

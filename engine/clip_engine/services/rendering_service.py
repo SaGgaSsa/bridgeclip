@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Optional, Union
@@ -62,6 +63,11 @@ LANDSCAPE_TITLE_SHOW_S = (0.4, 5.5)
 LANDSCAPE_TITLE_FADE_S = 0.4
 # Output frame rates a landscape render keeps from its source (higher is capped).
 MAX_OUTPUT_FPS = 60
+# Long edits (e.g. 180 keep intervals) build a filtergraph that exceeds the
+# Windows CreateProcess command-line limit (WinError 206) when passed as an
+# argv value. Above this size the graph goes through a closed temp file with
+# -/filter_complex instead; the graph bytes themselves are unchanged.
+FILTER_COMPLEX_SCRIPT_THRESHOLD = 8000
 # Landscape H.264 bitrates (Mbps) by output height at 30 fps, after
 # YouTube's upload recommendations; 60 fps sources get 1.5x.
 LANDSCAPE_BITRATE_MBPS = {1080: 12, 1440: 20, 2160: 45}
@@ -875,8 +881,34 @@ class RenderingService:
         for extra in (extra_inputs or []):
             cmd.extend(["-loop", "1", "-protocol_whitelist", "file,pipe,fd", "-i", extra])
 
+        # Long graphs exceed the Windows CreateProcess limit (WinError 206)
+        # when passed as an argv value. Write the exact same graph to a
+        # closed temp file and pass its path instead; inputs, order,
+        # dimensions and timing are unchanged. FFmpeg 9 removed
+        # -filter_complex_script, so the file value is passed with
+        # -/filter_complex (verified against FFmpeg 9.0.1).
+        filter_script_path: Optional[str] = None
+        if len(filter_complex) >= FILTER_COMPLEX_SCRIPT_THRESHOLD:
+            output_dir = os.path.dirname(os.path.abspath(output_path))
+            os.makedirs(output_dir, exist_ok=True)
+            fd, filter_script_path = tempfile.mkstemp(
+                prefix="ffmpeg-filter-", suffix=".filtergraph", dir=output_dir,
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                    handle.write(filter_complex)
+            except BaseException:
+                try:
+                    os.remove(filter_script_path)
+                except OSError:
+                    pass
+                raise
+            filter_arg = ["-/filter_complex", os.path.abspath(filter_script_path)]
+        else:
+            filter_arg = ["-filter_complex", filter_complex]
+
         cmd.extend([
-            "-filter_complex", filter_complex,
+            *filter_arg,
             "-map", "[out]",
             # MP4 edit lists account for AAC priming and reordered video.
             # make_zero shifts presentation time by encoder delay, moving the
@@ -911,6 +943,12 @@ class RenderingService:
             except OSError:
                 pass
             raise
+        finally:
+            if filter_script_path:
+                try:
+                    os.remove(filter_script_path)
+                except OSError:
+                    pass
 
     async def _validate_output_timing(
         self, output_path: str, duration_ms: int, fps: str, with_audio: bool,

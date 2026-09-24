@@ -1,5 +1,5 @@
 import { join } from 'path'
-import { cancelJob as cancelRunningJob, startClipJob, type ClipJobConfig, type JobEventSink } from './pipeline-runner'
+import { cancelJob as cancelRunningJob, defaultJobRuntimeSnapshot, startClipJob, type ClipJobConfig, type JobEventSink, type JobRuntimeSnapshot } from './pipeline-runner'
 import { finishRunRecord } from './run-history'
 import { logger } from './logger'
 import { parseJobOutput } from '../shared/job-output'
@@ -20,6 +20,11 @@ interface TrackedJob {
   snapshot: JobSnapshot
   config: ClipJobConfig
   outputDirectory: string
+  runtime: JobRuntimeSnapshot
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
 }
 
 const jobs = new Map<string, TrackedJob>()
@@ -55,11 +60,31 @@ function pruneFinished(): void {
 }
 
 /** Track a new job (its run record already exists) and start it as soon as a slot is free. */
-export function enqueueJob(jobId: string, config: ClipJobConfig, outputDirectory: string): JobSnapshot {
+export function enqueueJob(jobId: string, config: ClipJobConfig, outputDirectory: string, runtime?: JobRuntimeSnapshot): JobSnapshot {
+  // Freeze both the request and the provider/output/key settings: later UI
+  // changes must not alter this job. Secrets stay in `runtime`, which is
+  // never exposed through `listJobs()` or `jobs:update`.
+  const frozenConfig = cloneJson(config)
+  const makeDefaultRuntime = typeof defaultJobRuntimeSnapshot === 'function'
+    ? defaultJobRuntimeSnapshot
+    : (dir: string): JobRuntimeSnapshot => ({
+      outputDirectory: dir,
+      pythonPath: 'python3',
+      customVocabulary: '',
+      transcriptionProvider: 'openrouter',
+      plannerProvider: 'openrouter',
+      opencodeModel: 'opencode/muse-spark-1.3-contributor-free',
+      opencodeCommand: 'opencode',
+      localWhisperModel: 'small',
+      opencodeTimeoutSeconds: 300,
+      openrouterApiKey: ''
+    })
+  const frozenRuntime = runtime ? cloneJson(runtime) : makeDefaultRuntime(outputDirectory)
+  const effectiveOutputDirectory = frozenRuntime.outputDirectory || outputDirectory
   const snapshot: JobSnapshot = {
     id: jobId,
     revision: 0,
-    request: config,
+    request: frozenConfig,
     status: 'queued',
     percent: 0,
     step: 'Waiting for a free slot',
@@ -71,12 +96,12 @@ export function enqueueJob(jobId: string, config: ClipJobConfig, outputDirectory
     failureStage: null,
     httpStatus: null,
     output: null,
-    outputDir: join(outputDirectory, jobId),
+    outputDir: join(effectiveOutputDirectory, jobId),
     queuedAt: new Date().toISOString(),
     startedAt: null,
     finishedAt: null
   }
-  jobs.set(jobId, { snapshot, config, outputDirectory })
+  jobs.set(jobId, { snapshot, config: frozenConfig, outputDirectory: effectiveOutputDirectory, runtime: frozenRuntime })
   queue.push(jobId)
   broadcast(snapshot)
   pump()
@@ -96,7 +121,7 @@ function pump(): void {
       webContents: { isDestroyed: () => false, send: (channel, payload) => onRunnerEvent(jobId, channel, payload) }
     }
     try {
-      startClipJob(jobId, job.config, sink, () => onExit(jobId))
+      startClipJob(jobId, job.config, sink, () => onExit(jobId), job.runtime)
     } catch {
       running.delete(jobId)
       try { finishRunRecord(job.outputDirectory, jobId, 'failed', 'Could not start this run.') } catch { /* Output folder may be unavailable. */ }

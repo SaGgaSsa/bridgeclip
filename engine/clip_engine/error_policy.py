@@ -50,7 +50,19 @@ def safe_processing_error(error: Exception) -> str:
             "audio_chunk_failed": "Transcription audio preparation failed",
             "audio_chunk_too_large": "Transcription audio chunk exceeded the size limit",
             "missing_word_timestamps": "Transcription response lacked word timestamps",
+            "local_dependency_missing": "Local transcription needs faster-whisper",
         }.get(getattr(error, "reason", None), "Transcription failed")
+    if type(error).__name__ in {"IntelligencePlanningError", "OpenCodePlannerError"}:
+        text = str(error).lower()
+        if "opencode cli is not available" in text:
+            return "OpenCode CLI is not available"
+        if "opencode planning timed out" in text:
+            return "OpenCode planning timed out"
+        if "opencode returned an unusable planning response" in text:
+            return "OpenCode returned an unusable planning response"
+        if "local planning needs a transcript" in text:
+            return "Local planning needs a transcript and has no vision model"
+        return "Clip planning failed"
     if type(error).__name__ == "RenderingError":
         message = str(error).lower()
         if "no space left on device" in message or "disk quota exceeded" in message:
@@ -72,10 +84,21 @@ def safe_failure_code(error: Exception) -> str:
             "response_too_large", "source_missing", "audio_extraction_failed",
             "audio_extraction_empty", "audio_missing", "translation_unsupported",
             "audio_duration_unknown", "audio_chunk_failed", "audio_chunk_too_large",
-            "missing_word_timestamps",
+            "missing_word_timestamps", "local_dependency_missing",
         }:
             return f"transcription.{reason}"
         return "transcription.unknown"
+    if type(error).__name__ in {"IntelligencePlanningError", "OpenCodePlannerError"}:
+        text = str(error).lower()
+        if "opencode cli is not available" in text:
+            return "planning.opencode_missing"
+        if "opencode planning timed out" in text:
+            return "planning.opencode_timeout"
+        if "opencode returned an unusable" in text:
+            return "planning.opencode_invalid"
+        if "local planning needs a transcript" in text:
+            return "planning.local_no_transcript"
+        return "planning.failed"
     if type(error).__name__ == "VideoDownloadError":
         return "download.failed"
     if type(error).__name__ == "RenderingError":
@@ -97,7 +120,11 @@ def safe_job_error_text(error: str | None) -> str | None:
         "Audio duration could not be determined", "Transcription audio preparation failed",
         "Transcription audio chunk exceeded the size limit",
         "Transcription response lacked word timestamps",
-        "Video render failed",
+        "Local transcription needs faster-whisper",
+        "Video render failed", "Clip planning failed",
+        "OpenCode CLI is not available", "OpenCode planning timed out",
+        "OpenCode returned an unusable planning response",
+        "Local planning needs a transcript and has no vision model",
     }:
         return error
     return "Processing failed"

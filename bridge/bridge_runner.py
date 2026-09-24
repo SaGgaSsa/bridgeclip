@@ -32,6 +32,41 @@ _protocol = None
 # Mirrors DURATION_OPTIONS in src/shared/job-contract.ts.
 DURATION_RANGE_IDS = ("xshort", "short", "medium", "long", "xlong", "extended", "feature")
 
+# Local engine providers (bridge contract 1 defaults to legacy OpenRouter).
+TRANSCRIPTION_PROVIDERS = ("openrouter", "local")
+PLANNER_PROVIDERS = ("openrouter", "opencode")
+OPENCODE_DEFAULT_MODEL = "opencode/muse-spark-1.3-contributor-free"
+OPENCODE_DEFAULT_COMMAND = "opencode"
+
+
+def is_safe_opencode_command(value: object) -> bool:
+    """Simple executable name or absolute path, no shell or extra args."""
+    import re as _re
+
+    if not isinstance(value, str) or not value or len(value) > 512:
+        return False
+    if any(c in value for c in ("\0", "\n", "\r", ";", "&", "|", "$", "`", "'", '"', "<", ">", "(", ")")):
+        return False
+    if " " in value or "\t" in value:
+        return False
+    if os.path.isabs(value):
+        base = value.replace("/", os.sep).split(os.sep)[-1]
+        return bool(base and _re.fullmatch(r"[A-Za-z0-9_.-]+", base))
+    if "/" in value or "\\" in value:
+        return False
+    return bool(_re.fullmatch(r"[A-Za-z0-9_.-]+", value))
+
+
+def is_safe_opencode_model(value: object) -> bool:
+    """Model id safe as an argv element for the resolved .cmd launcher."""
+    import re as _re
+
+    if not isinstance(value, str) or not value or len(value) > 256:
+        return False
+    if any(c in value for c in (" ", "\t", "\n", "\r", '"', "'", "&", "|", "<", ">", "(", ")", "^", "%", "!", "`", "$", ";", "*", "?", "#", "~", "\0")):
+        return False
+    return bool(_re.fullmatch(r"[A-Za-z0-9_.:/@+~-]+", value))
+
 # Known failure classes -> (message, hint). Raw engine errors can contain
 # request URLs, proxy credentials and local paths, so only these fixed strings
 # reach the UI. First match wins.
@@ -39,6 +74,21 @@ FAILURES = (
     (("not enough disk space to save clips",),
      "There is not enough free disk space to finish this video.",
      "Free space on your startup disk and the output drive, then retry. Source videos can use several GB while clipping."),
+    (("opencode cli is not available",),
+     "OpenCode CLI is not available.",
+     "Install opencode and sign in, then retry."),
+    (("opencode planning timed out",),
+     "OpenCode planning timed out.",
+     "Retry with a shorter video or a longer timeout."),
+    (("opencode returned an unusable planning response",),
+     "OpenCode returned an unusable planning response.",
+     "Retry the run. If it persists, report this run."),
+    (("local planning needs a transcript",),
+     "Local planning needs a transcript and has no vision model.",
+     "Use a video with speech or enable transcription; local planning has no paid fallback."),
+    (("local transcription needs faster-whisper",),
+     "Local transcription is not available.",
+     "Install the local engine extras (faster-whisper), then retry."),
     (("transcription authentication failed",),
      "OpenRouter rejected the transcription request.",
      "Check the OpenRouter API key in Settings."),
@@ -141,6 +191,16 @@ async def run(config: dict) -> bool:
     config = validate_config(config)
     # Configure before BridgeClip imports: settings are cached by the engine.
     os.environ["LOCAL_MODE"] = "true"
+    transcription_provider = config.get("transcription_provider", "openrouter")
+    planner_provider = config.get("planner_provider", "openrouter")
+    os.environ["TRANSCRIPTION_PROVIDER"] = transcription_provider
+    os.environ["PLANNER_PROVIDER"] = planner_provider
+    os.environ["OPENCODE_MODEL"] = config.get("opencode_model", OPENCODE_DEFAULT_MODEL)
+    os.environ["OPENCODE_COMMAND"] = config.get("opencode_command", OPENCODE_DEFAULT_COMMAND)
+    if config.get("opencode_timeout_seconds") is not None:
+        os.environ["OPENCODE_TIMEOUT_SECONDS"] = str(config["opencode_timeout_seconds"])
+    if config.get("local_whisper_model"):
+        os.environ["LOCAL_WHISPER_MODEL"] = config["local_whisper_model"]
     if config.get("output_dir"):
         os.environ["LOCAL_OUTPUT_DIR"] = config["output_dir"]
     # Downloads use the user's own connection. A developer's BridgeClip .env can
@@ -169,8 +229,16 @@ async def run(config: dict) -> bool:
 
     settings = get_settings()
 
+    # OpenRouter key only when a chosen provider or layout vision needs it.
+    # The local path (local transcription + opencode planner + vision off)
+    # never calls OpenRouter and must work keyless.
+    needs_openrouter = (
+        transcription_provider == "openrouter"
+        or planner_provider == "openrouter"
+        or bool(config["layout_vision_enabled"])
+    )
     missing = []
-    if not settings.openrouter_api_key:
+    if needs_openrouter and not settings.openrouter_api_key:
         missing.append("OPENROUTER_API_KEY")
     if missing:
         emit({"type": "error", "message": f"Missing required API keys: {', '.join(missing)}"})
@@ -298,6 +366,39 @@ def validate_config(config: object) -> dict:
         any(item not in DURATION_RANGE_IDS for item in ranges)
     ):
         raise ValueError("Invalid clip duration")
+    # Providers default to legacy OpenRouter so contract 1 stays compatible.
+    if "transcription_provider" not in config:
+        config["transcription_provider"] = "openrouter"
+    if "planner_provider" not in config:
+        config["planner_provider"] = "openrouter"
+    if config["transcription_provider"] not in TRANSCRIPTION_PROVIDERS:
+        raise ValueError("Invalid transcription provider")
+    if config["planner_provider"] not in PLANNER_PROVIDERS:
+        raise ValueError("Invalid planner provider")
+    if "opencode_model" not in config or config["opencode_model"] is None:
+        config["opencode_model"] = OPENCODE_DEFAULT_MODEL
+    model = config["opencode_model"]
+    if not isinstance(model, str):
+        raise ValueError("Invalid opencode model")
+    model = model.strip()
+    if not is_safe_opencode_model(model):
+        raise ValueError("Invalid opencode model")
+    config["opencode_model"] = model
+    if "opencode_command" not in config or config["opencode_command"] is None:
+        config["opencode_command"] = OPENCODE_DEFAULT_COMMAND
+    if not is_safe_opencode_command(config["opencode_command"]):
+        raise ValueError("Invalid opencode command")
+    whisper_model = config.get("local_whisper_model")
+    if whisper_model is not None and (
+        not isinstance(whisper_model, str) or not whisper_model.strip()
+        or len(whisper_model) > 512 or "\0" in whisper_model
+    ):
+        raise ValueError("Invalid local whisper model")
+    if isinstance(whisper_model, str):
+        config["local_whisper_model"] = whisper_model.strip()
+    timeout = config.get("opencode_timeout_seconds")
+    if timeout is not None and (type(timeout) is not int or not 30 <= timeout <= 1200):
+        raise ValueError("Invalid opencode timeout")
     return config
 
 

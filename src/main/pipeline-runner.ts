@@ -6,7 +6,7 @@ import { promisify } from 'util'
 const execFileAsync = promisify(execFile)
 import { createInterface } from 'readline'
 import { Transform } from 'stream'
-import { loadSettings, getSettingsForBridge, vocabularyTerms } from './settings-store'
+import { loadSettings, getSettingsForBridge, vocabularyTerms, type AppSettings } from './settings-store'
 import { logger } from './logger'
 import { parseJobOutput, type JobOutput } from '../shared/job-output'
 import { BRIDGE_CONTRACT_VERSION } from '../shared/job-contract'
@@ -15,6 +15,56 @@ import { finishRunRecord, type StoredRunStatus } from './run-history'
 import { resolveBinary } from './tools'
 
 export type ClipJobConfig = ClipJobRequest
+
+/**
+ * Frozen provider/output/key settings for one job, taken when the job is
+ * queued. Later settings changes must not alter a queued or running job.
+ * Carried privately in the main process; never sent to the renderer.
+ */
+export interface JobRuntimeSnapshot {
+  outputDirectory: string
+  pythonPath: string
+  customVocabulary: string
+  transcriptionProvider: AppSettings['transcriptionProvider']
+  plannerProvider: AppSettings['plannerProvider']
+  opencodeModel: string
+  opencodeCommand: string
+  localWhisperModel: string
+  opencodeTimeoutSeconds: number
+  openrouterApiKey: string
+}
+
+/** Deep copy of the settings a job needs; later UI changes cannot mutate it. */
+export function takeJobRuntimeSnapshot(settings: AppSettings): JobRuntimeSnapshot {
+  return {
+    outputDirectory: settings.outputDirectory,
+    pythonPath: settings.pythonPath,
+    customVocabulary: settings.customVocabulary,
+    transcriptionProvider: settings.transcriptionProvider,
+    plannerProvider: settings.plannerProvider,
+    opencodeModel: settings.opencodeModel,
+    opencodeCommand: settings.opencodeCommand,
+    localWhisperModel: settings.localWhisperModel,
+    opencodeTimeoutSeconds: settings.opencodeTimeoutSeconds,
+    openrouterApiKey: settings.openrouterApiKey
+  }
+}
+
+/** Minimal runtime for legacy callers that enqueue without a snapshot (tests). Keeps the OpenRouter path. */
+export function defaultJobRuntimeSnapshot(outputDirectory: string): JobRuntimeSnapshot {
+  return {
+    outputDirectory,
+    pythonPath: 'python3',
+    customVocabulary: '',
+    transcriptionProvider: 'openrouter',
+    plannerProvider: 'openrouter',
+    opencodeModel: 'opencode/muse-spark-1.3-contributor-free',
+    opencodeCommand: 'opencode',
+    localWhisperModel: 'small',
+    opencodeTimeoutSeconds: 300,
+    openrouterApiKey: ''
+  }
+}
 
 /**
  * Where a run's events go. The job manager passes its own sink so it can track
@@ -309,7 +359,8 @@ export function startClipJob(
   jobId: string,
   config: ClipJobConfig,
   sink: JobEventSink,
-  onExit?: () => void
+  onExit?: () => void,
+  runtime?: JobRuntimeSnapshot
 ): void {
   const send = (channel: string, payload: unknown): void => {
     if (!sink.isDestroyed() && !sink.webContents.isDestroyed()) sink.webContents.send(channel, payload)
@@ -317,14 +368,16 @@ export function startClipJob(
   // Runs that never spawned a process still release their slot, just not
   // re-entrantly inside the caller's start.
   const exitWithoutProcess = (): void => { if (onExit) queueMicrotask(onExit) }
-  const settings = loadSettings()
+  // Snapshot at start: never re-read settings, so later UI changes cannot
+  // alter this job's provider, output folder or key.
+  const snapshot: JobRuntimeSnapshot = runtime ? { ...runtime } : takeJobRuntimeSnapshot(loadSettings())
   const finishHistory = (status: Exclude<StoredRunStatus, 'running'>, message: string | null = null): void => {
-    try { finishRunRecord(settings.outputDirectory, jobId, status, message) }
+    try { finishRunRecord(snapshot.outputDirectory, jobId, status, message) }
     catch { logger.warn('job.history.writeFailed', { jobId }) }
   }
   const reportError = (payload: JobErrorPayload): void => {
     try {
-      finishRunRecord(settings.outputDirectory, jobId, 'failed', safeBridgeText(payload.message), {
+      finishRunRecord(snapshot.outputDirectory, jobId, 'failed', safeBridgeText(payload.message), {
         failureCode: payload.failureCode ?? null,
         failureStage: payload.failureStage ?? null,
         httpStatus: payload.httpStatus ?? null
@@ -332,10 +385,10 @@ export function startClipJob(
     } catch { logger.warn('job.history.writeFailed', { jobId }) }
     send('job:error', payload)
   }
-  const envVars = getSettingsForBridge(settings)
+  const envVars = getSettingsForBridge({ openrouterApiKey: snapshot.openrouterApiKey, outputDirectory: snapshot.outputDirectory } as AppSettings)
   const enginePath = getEnginePath()
   const bridgePath = getBridgeRunnerPath()
-  const pythonPath = resolvePythonPath(enginePath, settings.pythonPath)
+  const pythonPath = resolvePythonPath(enginePath, snapshot.pythonPath)
 
   logger.info('job.start', {
     jobId,
@@ -344,6 +397,9 @@ export function startClipJob(
     autoClipCount: config.autoClipCount,
     aspectRatio: config.aspectRatio,
     captionPreset: config.captionPreset,
+    transcriptionProvider: snapshot.transcriptionProvider,
+    plannerProvider: snapshot.plannerProvider,
+    layoutVision: config.layoutVision,
     envKeys: Object.keys(envVars),
     isPackaged: app.isPackaged
   })
@@ -382,12 +438,18 @@ export function startClipJob(
     pacing: config.pacing || 'tight',
     include_captions: config.includeCaptions,
     caption_preset: config.captionPreset,
-    keyterms: vocabularyTerms(settings.customVocabulary),
+    keyterms: vocabularyTerms(snapshot.customVocabulary),
     start_time_seconds: config.startTimeSeconds,
     end_time_seconds: config.endTimeSeconds,
     banner_platform: config.bannerPlatform,
     banner_channel_url: config.bannerChannelUrl,
-    output_dir: settings.outputDirectory
+    transcription_provider: snapshot.transcriptionProvider,
+    planner_provider: snapshot.plannerProvider,
+    opencode_model: snapshot.opencodeModel,
+    opencode_command: snapshot.opencodeCommand,
+    local_whisper_model: snapshot.localWhisperModel,
+    opencode_timeout_seconds: snapshot.opencodeTimeoutSeconds,
+    output_dir: snapshot.outputDirectory
   })
 
   let jobWorkRoot: string
@@ -439,7 +501,7 @@ export function startClipJob(
   logger.info('job.spawned', { jobId, pid: child.pid })
 
   activeProcesses.set(jobId, child)
-  activeJobDirectories.set(jobId, settings.outputDirectory)
+  activeJobDirectories.set(jobId, snapshot.outputDirectory)
 
   let stderrBytes = 0
   let stdoutNonJsonLines = 0

@@ -60,6 +60,13 @@ MAX_TRANSCRIPTION_RESPONSE_BYTES = 4 * 1024 * 1024
 MAI_PRICE_PER_HOUR = 0.10
 WAV_INPUT_OPTIONS = ["-protocol_whitelist", "file,pipe,fd", "-format_whitelist", "wav"]
 
+# Local transcription (faster-whisper): CPU int8 by default, word timestamps on.
+LOCAL_WHISPER_DEVICE = "cpu"
+LOCAL_WHISPER_COMPUTE_TYPE = "int8"
+LOCAL_TRANSCRIPTION_MISSING_MESSAGE = (
+    "Local transcription needs faster-whisper. Install the local engine extras, then retry."
+)
+
 
 def _estimate_transcription_cost(duration_seconds: float) -> float:
     """Fallback estimate; prefer OpenRouter's actual usage.cost when returned."""
@@ -405,10 +412,113 @@ def find_sentence_start_boundary(
 
 
 class TranscriptionService:
-    """MAI Transcribe 2 speech recognition with word timing and speaker turns."""
+    """MAI Transcribe 2 speech recognition with word timing and speaker turns.
 
-    def __init__(self):
-        self.settings = get_settings()
+    When ``TRANSCRIPTION_PROVIDER=local`` the same call transcribes with a
+    local faster-whisper model (CPU int8, word timestamps) and never touches
+    OpenRouter, returning the same TranscriptionResult shape.
+    """
+
+    def __init__(self, settings=None):
+        self.settings = settings or get_settings()
+
+    @staticmethod
+    def _map_local_words(raw_words) -> list["TranscriptWord"]:
+        """Map faster-whisper words to finite, ordered ms timings.
+
+        Skips blank text and non-finite, negative or backwards timings
+        without inventing words. Never assigns speaker labels.
+        """
+        mapped: list[TranscriptWord] = []
+        for raw in raw_words or []:
+            if isinstance(raw, dict):
+                text = raw.get("word", raw.get("text"))
+                start = raw.get("start")
+                end = raw.get("end")
+            else:
+                text = getattr(raw, "word", None)
+                start = getattr(raw, "start", None)
+                end = getattr(raw, "end", None)
+            if not isinstance(text, str):
+                continue
+            cleaned = text.strip()
+            if not cleaned:
+                continue
+            if type(start) not in (int, float) or type(end) not in (int, float):
+                continue
+            if not math.isfinite(start) or not math.isfinite(end):
+                continue
+            if start < 0 or end < start:
+                continue
+            start_ms = round(start * 1000)
+            end_ms = round(end * 1000)
+            if mapped and start_ms < mapped[-1].start_time_ms:
+                continue
+            mapped.append(TranscriptWord(cleaned, start_ms, end_ms))
+        return mapped
+
+    def _build_local_result(self, whisper_segments, language, audio_duration: float, model_name: str) -> "TranscriptionResult":
+        """Build TranscriptionResult from faster-whisper segments (testable)."""
+        segments: list[TranscriptSegment] = []
+        for seg in whisper_segments or []:
+            if isinstance(seg, dict):
+                raw_words = seg.get("words") or []
+                start = seg.get("start")
+                end = seg.get("end")
+            else:
+                raw_words = getattr(seg, "words", None) or []
+                start = getattr(seg, "start", None)
+                end = getattr(seg, "end", None)
+            words = self._map_local_words(raw_words)
+            if not words:
+                continue
+            seg_start = words[0].start_time_ms
+            seg_end = words[-1].end_time_ms
+            start_ok = type(start) in (int, float) and math.isfinite(start) and start >= 0
+            end_ok = type(end) in (int, float) and math.isfinite(end) and end >= 0
+            if start_ok:
+                seg_start = min(seg_start, round(start * 1000))
+            if start_ok and end_ok and end >= start:
+                seg_end = max(seg_end, round(end * 1000))
+            label = " ".join(w.word for w in words)
+            segments.append(TranscriptSegment(seg_start, seg_end, label, None, words, []))
+        full_text = " ".join(s.text for s in segments)
+        detected = language if isinstance(language, str) and language else None
+        return TranscriptionResult(
+            segments=segments, full_text=full_text, language=detected,
+            duration_seconds=audio_duration, provider="local", model=model_name,
+            api_costs=TranscriptionApiCosts(provider="local", model=model_name,
+                                             audio_duration_seconds=audio_duration or 0.0,
+                                             estimated_cost_usd=0.0),
+        )
+
+    async def _transcribe_local(self, audio_path: str, language: Optional[str]) -> "TranscriptionResult":
+        """Transcribe with faster-whisper (lazy import, CPU int8, auto language)."""
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            raise TranscriptionError(LOCAL_TRANSCRIPTION_MISSING_MESSAGE, reason="local_dependency_missing") from None
+        model_name = (getattr(self.settings, "local_whisper_model", None) or "small").strip() or "small"
+        duration = await asyncio.to_thread(self._audio_duration, audio_path)
+        lang = None if not language or language == "auto" else language
+        try:
+            model = await asyncio.to_thread(
+                WhisperModel, model_name, device=LOCAL_WHISPER_DEVICE,
+                compute_type=LOCAL_WHISPER_COMPUTE_TYPE,
+            )
+            segments_iter, info = await asyncio.to_thread(
+                model.transcribe, audio_path, language=lang, word_timestamps=True,
+            )
+            whisper_segments = await asyncio.to_thread(list, segments_iter)
+            detected = getattr(info, "language", None) or lang
+        except TranscriptionError:
+            raise
+        except (OSError, ValueError, RuntimeError) as e:
+            raise TranscriptionError(f"Local transcription failed: {type(e).__name__}", reason="transcription_failed") from None
+        except Exception:
+            raise TranscriptionError("Local transcription failed", reason="transcription_failed") from None
+        # Empty or silent audio is valid: return no words without inventing any.
+        return self._build_local_result(whisper_segments, detected, duration, model_name)
 
     async def transcribe(
         self,
@@ -516,6 +626,12 @@ class TranscriptionService:
         """Transcribe bounded chunks and retain timestamps on the source timeline."""
         if not os.path.isfile(audio_path):
             raise TranscriptionError("Audio file not found", reason="audio_missing")
+        provider = str(getattr(self.settings, "transcription_provider", "openrouter") or "openrouter").lower()
+        if provider == "local":
+            if translate_to_english:
+                raise TranscriptionError("Local transcription does not translate audio", reason="translation_unsupported")
+            # Local path never calls OpenRouter and needs no API key.
+            return await self._transcribe_local(audio_path, language)
         if not self.settings.openrouter_api_key:
             raise TranscriptionProviderError("auth")
         if translate_to_english:

@@ -15,6 +15,7 @@
     "url": "https://github.com/bridge-mind/bridgeclip/issues"
   },
   "scripts": {
+    "setup:windows": "powershell -ExecutionPolicy Bypass -File scripts/setup-windows.ps1",
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",

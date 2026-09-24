@@ -15,6 +15,8 @@ export function SetupCard({ onOpenSettings, className }: { onOpenSettings: () =>
   const { missingKeys, toolsOk } = useSetupState()
   const toolStatus = useSettingsStore((s) => s.toolStatus)
   const toolError = useSettingsStore((s) => s.toolError)
+  const transcriptionProvider = useSettingsStore((s) => s.transcriptionProvider)
+  const plannerProvider = useSettingsStore((s) => s.plannerProvider)
   const { drafts, setDraft, persist, error } = useApiKeyDrafts()
   const missingTools = toolStatus
     ? [
@@ -23,6 +25,8 @@ export function SetupCard({ onOpenSettings, className }: { onOpenSettings: () =>
         !toolStatus.ffmpeg && 'FFmpeg',
         !toolStatus.ffprobe && 'FFprobe',
         !toolStatus.ytdlp && 'yt-dlp',
+        transcriptionProvider === 'local' && !toolStatus.fasterWhisper && 'Local transcription (faster-whisper)',
+        plannerProvider === 'opencode' && !toolStatus.opencode && 'OpenCode CLI',
         !toolStatus.engine && 'BridgeClip clipping engine',
         !toolStatus.bridgeRunner && 'Bridge runner'
       ].filter(Boolean).join(', ')
