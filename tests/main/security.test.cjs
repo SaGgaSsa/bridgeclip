@@ -227,7 +227,7 @@ test('saved provider keys remain in main and migrate away from legacy encoding',
   const settingsStore = loadSource('settings-store.ts', {
     electron: {
       app: { getPath: (name) => ({ home: root, appData: root, userData }[name]), isReady: () => true },
-      safeStorage: { isEncryptionAvailable: () => true, encryptString: (value) => Buffer.from(value), decryptString: (value) => value.toString() }
+      safeStorage: { isEncryptionAvailable: () => true, getSelectedStorageBackend: () => 'gnome_libsecret', encryptString: (value) => Buffer.from(value), decryptString: (value) => value.toString() }
     }
   })
   try {
@@ -258,7 +258,7 @@ test('settings migration retires ElevenLabs without decrypting it and preserves 
   }))
   const store = loadSource('settings-store.ts', { electron: {
     app: { getPath: (name) => ({ home: root, appData: root, userData }[name]), isReady: () => true },
-    safeStorage: { isEncryptionAvailable: () => true, encryptString: (value) => Buffer.from(value),
+    safeStorage: { isEncryptionAvailable: () => true, getSelectedStorageBackend: () => 'gnome_libsecret', encryptString: (value) => Buffer.from(value),
       decryptString: (value) => { assert.notEqual(value.toString(), 'retired-key'); return value.toString() } }
   } })
   try {
@@ -281,7 +281,7 @@ test('settings migration writes a private file', () => {
   const store = loadSource('settings-store.ts', {
     electron: {
       app: { getPath: (name) => ({ home: root, appData: root, userData }[name]), isReady: () => true },
-      safeStorage: { isEncryptionAvailable: () => true, encryptString: (value) => Buffer.from(value), decryptString: (value) => value.toString() }
+      safeStorage: { isEncryptionAvailable: () => true, getSelectedStorageBackend: () => 'gnome_libsecret', encryptString: (value) => Buffer.from(value), decryptString: (value) => value.toString() }
     }
   })
   try {
@@ -497,9 +497,11 @@ test('network policy rejects private literals and private DNS results', async ()
     './security': security,
     'dns/promises': { lookup: async (host) => [{ address: host === 'public.example' ? '93.184.216.34' : '10.0.0.1' }] }
   })
-  for (const address of ['127.0.0.1', '10.1.2.3', '169.254.169.254', '192.168.1.1', '::1', '::ffff:127.0.0.1', 'fc00::1']) assert.equal(policy.isPublicAddress(address), false)
-  assert.equal(policy.isPublicAddress('8.8.8.8'), true)
-  assert.equal(policy.isPublicAddress('2606:4700::1111'), true)
+  for (const address of ['127.0.0.1', '10.1.2.3', '169.254.169.254', '192.168.1.1', '::1', '::ffff:127.0.0.1', 'fc00::1',
+    '2002:c000:0204::1', '2001::1', '2001:1::1', '2001:2::1', '2001:10::1', '2001:2f::1', '2001:db8::1', '3fff::1']) assert.equal(policy.isPublicAddress(address), false, address)
+  for (const address of ['8.8.8.8', '2606:4700::1111', '2001:4860:4860::8888', '2001:470:1f0b::1', '2001:0db9:0000:0000:0000:0000:0000:0001']) {
+    assert.equal(policy.isPublicAddress(address), true, address)
+  }
   for (const url of ['http://localhost', 'http://127.0.0.1', 'http://[::1]', 'http://internal.example']) await assert.rejects(() => policy.assertPublicWebUrl(url))
   await policy.assertPublicWebUrl('https://public.example/video')
 })
@@ -551,4 +553,32 @@ test('cancellation retains a live process group after the leader closes and forc
   assert.deepEqual(signals, [{ pid: -12345, signal: 'SIGTERM' }, { pid: -12345, signal: 'SIGKILL' }])
   assert.equal(runner.hasActiveJobs(), false)
   assert.equal(sent.length, 0)
+})
+
+test('crash logs keep safe diagnostics without leaking credentials from errors', () => {
+  const lines = []
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-log-test-'))
+  const { logger, errorSummary } = loadSource('logger.ts', {
+    electron: { app: { getPath: () => logDir } },
+    fs: { ...fs, appendFileSync: (_file, line) => lines.push(JSON.parse(line)) }
+  }, { console: { log() {}, warn() {}, error() {} } })
+  const error = new Error('Authorization: Bearer sk-or-v1-secretcredential on /Users/dev/Library/clip.mp4')
+  error.code = 'ENOENT'
+  error.stack = `Error: ${error.message}\n    at sk-or-v1-secretcredential (/Users/dev/app/out/main/index.js:42:13)`
+  logger.error('main.uncaughtException', errorSummary(error))
+  const entry = lines[0]
+  assert.equal(entry.name, 'Error')
+  assert.equal(entry.code, 'ENOENT')
+  assert.equal(entry.frame, 'main.index.js:42')
+  assert.equal(errorSummary('plain rejection').name, 'Error')
+  const malicious = new Error('API key sk-or-v1-secretcredential')
+  malicious.name = 'sk-or-v1-secretcredential'
+  malicious.code = 'sk-or-v1-secretcredential'
+  malicious.stack = 'Error\n    at sk-or-v1-secretcredential (/Users/sk-or-v1-secretcredential/secrets.js:1:2)'
+  logger.error('main.unhandledRejection', errorSummary(malicious))
+  assert.equal(lines[1].name, 'Error')
+  assert.equal(lines[1].code, '')
+  assert.equal(lines[1].frame, '')
+  assert.doesNotMatch(JSON.stringify(lines), /sk-or-v1-secretcredential|\/Users\/dev/)
+  fs.rmSync(logDir, { recursive: true, force: true })
 })
