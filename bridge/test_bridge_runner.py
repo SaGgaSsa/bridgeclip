@@ -67,7 +67,7 @@ class BridgeTests(unittest.TestCase):
         self.assertIn('"type": "result"', output.getvalue())
 
     def test_rejects_invalid_config_without_importing_bridgeclip(self):
-        for value in ([], None, "config", self.config(contract_version=None), self.config(contract_version=2), self.config(layout_vision_enabled=None), self.config(job_id="../escape"), self.config(video_url="file:///etc/passwd"), self.config(max_clips=True), self.config(aspect_ratio="1:1"), self.config(layout_style="unknown"), self.config(pacing="unknown"), self.config(duration_ranges=["unknown"])):
+        for value in ([], None, "config", self.config(contract_version=None), self.config(contract_version=2), self.config(layout_vision_enabled=None), self.config(job_id="../escape"), self.config(video_url="file:///etc/passwd"), self.config(max_clips=True), self.config(aspect_ratio="1:1"), self.config(layout_style="unknown"), self.config(pacing="unknown"), self.config(clipping_mode="unknown"), self.config(duration_ranges=["unknown"])):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 bridge.validate_config(value)
 
@@ -93,6 +93,26 @@ class BridgeTests(unittest.TestCase):
         with patch.dict(sys.modules, modules), redirect_stdout(io.StringIO()):
             self.assertFalse(asyncio.run(bridge.run(self.config(layout_vision_enabled=False))))
         self.assertEqual(observed, ["false"])
+
+    def test_economy_models_are_selected_before_engine_settings_load(self):
+        observed = []
+        def get_settings():
+            observed.append({key: os.environ.get(key) for key in (
+                "CLIPPING_MODE", "PLANNER_MODEL", "PLANNER_FALLBACK_MODELS", "LAYOUT_VISION_ENABLED"
+            )})
+            return types.SimpleNamespace(openrouter_api_key=None)
+        modules = {
+            "clip_engine.config": types.SimpleNamespace(get_settings=get_settings, get_caption_preset=lambda name: None),
+            "clip_engine.bridge_contract": types.SimpleNamespace(BRIDGE_CONTRACT_VERSION=1),
+            "clip_engine.logging_safety": types.SimpleNamespace(install_safe_logging=lambda: None),
+            "clip_engine.services.ai_clipping_pipeline": types.SimpleNamespace(AIClippingPipeline=None, ClippingJobRequest=None, JobStatus=None),
+        }
+        with patch.dict(sys.modules, modules), patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
+            self.assertFalse(asyncio.run(bridge.run(self.config(clipping_mode="economy"))))
+        self.assertEqual(observed, [{
+            "CLIPPING_MODE": "economy", "PLANNER_MODEL": "z-ai/glm-5.3-flash",
+            "PLANNER_FALLBACK_MODELS": "", "LAYOUT_VISION_ENABLED": "false",
+        }])
 
     def test_malformed_json_has_structured_error_and_failure_exit(self):
         output = io.StringIO()
@@ -129,7 +149,7 @@ class BridgeTests(unittest.TestCase):
 
     def test_failures_map_to_fixed_messages(self):
         blocked = bridge.describe_failure("YouTube download failed after trying all 5 proxies. Last error: ERROR: unable to download video data: HTTP Error 403: Forbidden")
-        self.assertEqual(blocked["message"], "YouTube refused the download.")
+        self.assertEqual(blocked["message"], "The video service refused the download.")
         secret = "socks5h://user:secret-pass@10.0.0.1:1 /Users/someone/private.mp4"
         fallback = bridge.describe_failure(RuntimeError(secret))
         self.assertEqual(fallback["message"], "The clipping pipeline failed.")
@@ -138,7 +158,8 @@ class BridgeTests(unittest.TestCase):
         empty = bridge.describe_failure("No clip-worthy moments found (the video may have no speech, or the selected time range is too short for the chosen clip length)")
         self.assertEqual(empty["message"], "BridgeClip couldn't find any clips in this video.")
         self.assertEqual(bridge.describe_failure("Transcription authentication failed")["message"], "OpenRouter rejected the transcription request.")
-        self.assertEqual(bridge.describe_failure("Transcription quota or rate limit reached")["message"], "OpenRouter could not transcribe the video because its quota or rate limit was reached.")
+        self.assertEqual(bridge.describe_failure("Transcription account credit limit reached")["message"], "OpenRouter could not transcribe the video because the account has insufficient credit or a spending limit.")
+        self.assertEqual(bridge.describe_failure("Transcription providers are temporarily rate limited")["message"], "Transcription providers are busy after automatic retries and fallback attempts.")
         self.assertEqual(bridge.describe_failure("Transcription service unavailable")["message"], "OpenRouter could not be reached for transcription.")
         self.assertEqual(bridge.describe_failure("Transcription request rejected by provider")["message"], "OpenRouter rejected the transcription audio request.")
         self.assertEqual(bridge.describe_failure("Transcription response lacked word timestamps")["message"], "OpenRouter returned a transcript without word timestamps.")
@@ -146,6 +167,23 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(bridge.describe_failure("Not enough disk space to save clips")["message"],
                          "There is not enough free disk space to finish this video.")
         self.assertEqual(bridge.describe_failure("Video download failed")["message"], "The video could not be downloaded.")
+
+    def test_twitch_failures_are_actionable_and_safe_for_the_desktop(self):
+        cases = {
+            "Unsupported Twitch source": "Choose a public, completed Twitch VOD.",
+            "Twitch VOD is not completed": "This Twitch video is still live or processing.",
+            "Twitch VOD duration is invalid or too long": "This Twitch video has no usable duration or exceeds the six hour limit.",
+            "Twitch VOD unavailable": "The Twitch VOD could not be downloaded.",
+        }
+        for error, message in cases.items():
+            with self.subTest(error=error):
+                result = bridge.describe_failure(error)
+                self.assertEqual(result["message"], message)
+                self.assertTrue(result["hint"])
+                for value in result.values():
+                    self.assertNotIn("/", value)
+                    self.assertNotIn("https:", value)
+        self.assertIn("signed out", bridge.describe_failure("Twitch VOD unavailable")["hint"])
 
     def test_engine_stdout_cannot_corrupt_protocol(self):
         script = (

@@ -3,6 +3,8 @@ import type { JobOutput } from './job-output'
 /** Options for one clipping run, as the Create wizard submits them. */
 export interface ClipJobRequest {
   videoUrl: string
+  /** Missing on older queued requests; those retain the original quality mode. */
+  clippingMode?: 'quality' | 'economy'
   maxClips: number | null
   autoClipCount: boolean
   durationRanges: string[] | null
@@ -20,6 +22,8 @@ export interface ClipJobRequest {
 
 /** How many clipping runs the main process lets run at once; the rest wait in a queue. */
 export const MAX_PARALLEL_JOBS = 2
+/** Finished runs retained in the live session; older runs remain on disk. */
+export const MAX_FINISHED_JOBS = 50
 
 export type ActiveJobStatus = 'queued' | 'pending' | 'downloading' | 'transcribing' | 'planning' | 'rendering' | 'uploading'
 export type TerminalJobStatus = 'completed' | 'failed' | 'cancelled'

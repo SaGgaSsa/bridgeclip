@@ -133,8 +133,9 @@ class TestLocalTranscriptionPath:
         service = make_transcription_service(transcription_provider="local")
         called = {}
 
-        async def fake_local(audio_path, language):
+        async def fake_local(audio_path, language, timeline_offset_seconds=0.0):
             called["audio"] = audio_path
+            called["offset"] = timeline_offset_seconds
             return TranscriptionResult(segments=[], full_text="", provider="local", model="small")
 
         async def fail_openrouter(*args, **kwargs):
@@ -146,6 +147,55 @@ class TestLocalTranscriptionPath:
         result = asyncio.run(service.transcribe_audio("/tmp/audio.wav"))
         assert result.provider == "local"
         assert called["audio"] == "/tmp/audio.wav"
+        assert called["offset"] == 0.0
+
+    def test_local_window_shifts_timestamps_to_video_clock(self, monkeypatch):
+        # transcribe() extracts only a window starting at window_start and
+        # passes it as timeline_offset_seconds: local words/segments must
+        # come back on the video clock, like the OpenRouter branch, while
+        # durations stay those of the transcribed audio.
+        service = make_transcription_service(transcription_provider="local")
+        monkeypatch.setattr("os.path.isfile", lambda path: True)
+        monkeypatch.setattr(
+            TranscriptionService, "_audio_duration", staticmethod(lambda path: 30.0),
+        )
+
+        class FakeModel:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def transcribe(self, audio_path, language=None, word_timestamps=True):
+                assert word_timestamps is True
+                segments = [SimpleNamespace(start=1.0, end=3.0, words=[
+                    SimpleNamespace(word="hello", start=1.0, end=1.5),
+                    SimpleNamespace(word="world.", start=1.5, end=3.0),
+                ])]
+                return segments, SimpleNamespace(language="en")
+
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "faster_whisper" or name.startswith("faster_whisper."):
+                return SimpleNamespace(WhisperModel=FakeModel)
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        result = asyncio.run(service.transcribe_audio("/tmp/window.wav", timeline_offset_seconds=125.0))
+        assert result.provider == "local"
+        assert result.language == "en"
+        assert len(result.segments) == 1
+        segment = result.segments[0]
+        assert [(w.word, w.start_time_ms, w.end_time_ms) for w in segment.words] == [
+            ("hello", 126000, 126500), ("world.", 126500, 128000),
+        ]
+        assert (segment.start_time_ms, segment.end_time_ms) == (126000, 128000)
+        assert result.full_text == "hello world."
+        # Durations describe the transcribed audio, not the video clock.
+        assert result.duration_seconds == 30.0
+        assert result.api_costs.audio_duration_seconds == 30.0
+        assert result.api_costs.estimated_cost_usd == 0.0
 
     def test_missing_faster_whisper_has_fixed_message(self, monkeypatch):
         service = make_transcription_service(transcription_provider="local")

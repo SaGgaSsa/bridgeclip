@@ -360,7 +360,7 @@ export function startClipJob(
   config: ClipJobConfig,
   sink: JobEventSink,
   onExit?: () => void,
-  runtime?: JobRuntimeSnapshot
+  runtime?: JobRuntimeSnapshot | string
 ): void {
   const send = (channel: string, payload: unknown): void => {
     if (!sink.isDestroyed() && !sink.webContents.isDestroyed()) sink.webContents.send(channel, payload)
@@ -369,8 +369,14 @@ export function startClipJob(
   // re-entrantly inside the caller's start.
   const exitWithoutProcess = (): void => { if (onExit) queueMicrotask(onExit) }
   // Snapshot at start: never re-read settings, so later UI changes cannot
-  // alter this job's provider, output folder or key.
-  const snapshot: JobRuntimeSnapshot = runtime ? { ...runtime } : takeJobRuntimeSnapshot(loadSettings())
+  // alter this job's provider, output folder or key. A queued job keeps the
+  // output folder chosen when its run record was created: a plain string
+  // fifth argument is that legacy queued output directory.
+  const snapshot: JobRuntimeSnapshot = typeof runtime === 'string'
+    ? { ...takeJobRuntimeSnapshot(loadSettings()), outputDirectory: runtime }
+    : runtime
+      ? { ...runtime }
+      : takeJobRuntimeSnapshot(loadSettings())
   const finishHistory = (status: Exclude<StoredRunStatus, 'running'>, message: string | null = null): void => {
     try { finishRunRecord(snapshot.outputDirectory, jobId, status, message) }
     catch { logger.warn('job.history.writeFailed', { jobId }) }
@@ -429,12 +435,13 @@ export function startClipJob(
     contract_version: BRIDGE_CONTRACT_VERSION,
     job_id: jobId,
     video_url: config.videoUrl,
+    clipping_mode: config.clippingMode ?? 'quality',
     max_clips: config.maxClips,
     auto_clip_count: config.autoClipCount,
     duration_ranges: config.durationRanges,
     aspect_ratio: config.aspectRatio,
     layout_style: config.layoutStyle || 'auto',
-    layout_vision_enabled: config.layoutVision,
+    layout_vision_enabled: config.clippingMode === 'economy' ? false : config.layoutVision,
     pacing: config.pacing || 'tight',
     include_captions: config.includeCaptions,
     caption_preset: config.captionPreset,

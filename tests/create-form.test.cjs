@@ -7,12 +7,13 @@ const { renderToStaticMarkup } = require('react-dom/server')
 
 const bundled = buildSync({
   stdin: {
-    contents: `export { FormatStep, JobForm, parseTrimRange } from './src/renderer/components/JobForm';
+    contents: `export { FormatStep, ClipsStep, JobForm, buildJobRequest, parseTrimRange } from './src/renderer/components/JobForm';
       export { SetupCard } from './src/renderer/components/SetupCard';
       export { useSettingsStore, deriveSetupState } from './src/renderer/store/use-settings-store';
-      export { isValidSourceLink } from './src/renderer/components/SourcePicker';
+      export { SourcePicker, isValidSourceLink } from './src/renderer/components/SourcePicker';
       export { framingProblem, sourceAnalysisNotice } from './src/renderer/components/ClipList';
-      export { parseJobOutput } from './src/shared/job-output';`,
+      export { parseJobOutput } from './src/shared/job-output';
+      export { twitchVodId, normalizeVideoSource } from './src/shared/video-source';`,
     resolveDir: path.resolve(__dirname, '..'),
     loader: 'ts'
   },
@@ -77,6 +78,22 @@ test('the wizard opens on the video step with the steps listed in order', () => 
   assert.match(html, /Choose a video/)
 })
 
+test('clipping mode is selectable and economy disables paid vision in the submitted request', () => {
+  const { ClipsStep, buildJobRequest } = form.exports
+  const draft = {
+    source: 'https://example.com/video', clippingMode: 'economy', aspectRatio: '9:16', layoutStyle: 'auto',
+    layoutVision: true, pacing: 'tight', durations: ['short'], autoClipCount: true, maxClips: 5,
+    includeCaptions: true, captionPreset: 'pop'
+  }
+  const html = renderToStaticMarkup(React.createElement(ClipsStep, { draft, update() {} }))
+  assert.match(html, /aria-label="Clipping mode"/)
+  assert.match(html, /Economy/)
+  const request = buildJobRequest(draft, { start: null, end: null })
+  assert.equal(request.clippingMode, 'economy')
+  assert.equal(request.layoutVision, false)
+  assert.equal(buildJobRequest({ ...draft, clippingMode: 'quality' }, { start: null, end: null }).layoutVision, true)
+})
+
 test('format and framing radio groups each expose one keyboard tab stop', () => {
   const draft = { aspectRatio: '9:16', layoutStyle: 'auto', layoutVision: true, pacing: 'tight' }
   const html = renderToStaticMarkup(React.createElement(FormatStep, { draft, update() {} }))
@@ -119,4 +136,20 @@ test('visual-only runs disclose unavailable captions and preserve analysis statu
   assert.equal(output.metrics.visual_frame_count, 12)
   assert.equal(output.metrics.captions_status, 'unavailable_without_transcript')
   assert.match(sourceAnalysisNotice(output), /No speech was detected/)
+})
+
+test('Twitch VOD links canonicalize while other Twitch pages are rejected', () => {
+  const { normalizeVideoSource, twitchVodId, SourcePicker } = form.exports
+  for (const host of ['twitch.tv', 'www.twitch.tv', 'm.twitch.tv', 'go.twitch.tv']) {
+    const source = `https://${host}/videos/12345/?t=1h&tracking=secret`
+    assert.equal(isValidSourceLink(source), true)
+    assert.equal(normalizeVideoSource(source), 'https://www.twitch.tv/videos/12345')
+    assert.equal(twitchVodId(source), '12345')
+  }
+  for (const source of ['https://twitch.tv/channel', 'https://clips.twitch.tv/Clip', 'https://player.twitch.tv/?video=123', 'https://twitch.tv/videos/nope', 'https://twitch.tv:8443/videos/123']) assert.equal(isValidSourceLink(source), false)
+  assert.equal(twitchVodId('https://twitch.tv.evil.test/videos/123'), null)
+  const html = renderToStaticMarkup(React.createElement(SourcePicker, { value: 'https://www.twitch.tv/videos/12345', onChange() {} }))
+  assert.match(html, /Twitch VOD/)
+  assert.match(html, /Public, completed videos only/)
+  assert.doesNotMatch(html, /<img/)
 })

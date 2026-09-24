@@ -17,16 +17,17 @@ function loadShared(file) {
   const source = fs.readFileSync(path.join(__dirname, '../../src/shared', file), 'utf8')
   const js = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
   const module = { exports: {} }
-  vm.runInNewContext(js, { module, exports: module.exports, require })
+  vm.runInNewContext(js, { module, exports: module.exports, require, URL })
   return module.exports
 }
 const TEST_WORK_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-worker-test-'))
 process.on('exit', () => fs.rmSync(TEST_WORK_HOME, { recursive: true, force: true }))
 const jobContract = loadShared('job-contract.ts')
 const jobOutput = loadShared('job-output.ts')
-const runHistory = loadSource('run-history.ts')
+const videoSource = loadShared('video-source.ts')
+const runHistory = loadSource('run-history.ts', { '../shared/video-source': videoSource })
 const security = loadSource('security.ts', { electron: {}, '../shared/brand': loadShared('brand.ts') })
-const { validateJobConfig } = loadSource('validation.ts', { './security': security, '../shared/job-contract': jobContract })
+const { validateJobConfig } = loadSource('validation.ts', { './security': security, '../shared/video-source': videoSource, '../shared/job-contract': jobContract })
 
 test('development checks the staged FFmpeg that the clipping engine uses', async () => {
   const binDir = path.join(__dirname, '../../engine-bin')
@@ -53,6 +54,7 @@ test('Zernio sign-in links stay on its HTTPS origin and provider errors are sani
   const provider = loadSource('zernio/client.ts', {
     '../../shared/zernio': loadShared('zernio.ts'),
     '../http-response': loadSource('http-response.ts'),
+    '../logger': { logger: { info() {}, warn() {}, error() {} } },
     '../network-policy': { assertPublicWebUrl: async () => {}, isPublicAddress: security.isPublicAddress ?? (() => false) }
   }, {
     AbortSignal,
@@ -213,8 +215,12 @@ test('external URLs reject executable schemes and embedded credentials', () => {
 test('job validation rejects malformed options and invalid trim intervals', () => {
   const job = { videoUrl: 'https://example.com/video', maxClips: 5, autoClipCount: true, includeCaptions: true, aspectRatio: '9:16', layoutStyle: 'auto', layoutVision: true, pacing: 'tight', captionPreset: 'pop', durationRanges: ['short'], startTimeSeconds: null, endTimeSeconds: null, bannerPlatform: null, bannerChannelUrl: null }
   assert.doesNotThrow(() => validateJobConfig(job))
+  assert.doesNotThrow(() => validateJobConfig({ ...job, clippingMode: 'economy' }))
+  assert.doesNotThrow(() => validateJobConfig({ ...job, clippingMode: 'quality' }))
   for (const option of jobContract.DURATION_OPTIONS) assert.doesNotThrow(() => validateJobConfig({ ...job, durationRanges: [option.id] }))
-  for (const patch of [{ maxClips: -1 }, { startTimeSeconds: NaN }, { startTimeSeconds: 5, endTimeSeconds: 3 }, { videoUrl: 'file:///etc/passwd' }, { durationRanges: ['unexpected'] }, { includeCaptions: 'false' }, { layoutVision: 'true' }, { aspectRatio: '1:1' }]) assert.throws(() => validateJobConfig({ ...job, ...patch }))
+  assert.equal(validateJobConfig({ ...job, videoUrl: 'https://go.twitch.tv/videos/123?t=30s' }).videoUrl, 'https://www.twitch.tv/videos/123')
+  for (const videoUrl of ['https://twitch.tv/channel', 'https://clips.twitch.tv/Clip']) assert.throws(() => validateJobConfig({ ...job, videoUrl }), /completed Twitch VOD/)
+  for (const patch of [{ maxClips: -1 }, { startTimeSeconds: NaN }, { startTimeSeconds: 5, endTimeSeconds: 3 }, { videoUrl: 'file:///etc/passwd' }, { durationRanges: ['unexpected'] }, { includeCaptions: 'false' }, { layoutVision: 'true' }, { aspectRatio: '1:1' }, { clippingMode: 'unknown' }]) assert.throws(() => validateJobConfig({ ...job, ...patch }))
 })
 
 test('saved provider keys remain in main and migrate away from legacy encoding', () => {
@@ -226,7 +232,7 @@ test('saved provider keys remain in main and migrate away from legacy encoding',
   const settingsStore = loadSource('settings-store.ts', {
     electron: {
       app: { getPath: (name) => ({ home: root, appData: root, userData }[name]), isReady: () => true },
-      safeStorage: { isEncryptionAvailable: () => true, encryptString: (value) => Buffer.from(value), decryptString: (value) => value.toString() }
+      safeStorage: { isEncryptionAvailable: () => true, getSelectedStorageBackend: () => 'gnome_libsecret', encryptString: (value) => Buffer.from(value), decryptString: (value) => value.toString() }
     }
   })
   try {
@@ -257,7 +263,7 @@ test('settings migration retires ElevenLabs without decrypting it and preserves 
   }))
   const store = loadSource('settings-store.ts', { electron: {
     app: { getPath: (name) => ({ home: root, appData: root, userData }[name]), isReady: () => true },
-    safeStorage: { isEncryptionAvailable: () => true, encryptString: (value) => Buffer.from(value),
+    safeStorage: { isEncryptionAvailable: () => true, getSelectedStorageBackend: () => 'gnome_libsecret', encryptString: (value) => Buffer.from(value),
       decryptString: (value) => { assert.notEqual(value.toString(), 'retired-key'); return value.toString() } }
   } })
   try {
@@ -280,7 +286,7 @@ test('settings migration writes a private file', () => {
   const store = loadSource('settings-store.ts', {
     electron: {
       app: { getPath: (name) => ({ home: root, appData: root, userData }[name]), isReady: () => true },
-      safeStorage: { isEncryptionAvailable: () => true, encryptString: (value) => Buffer.from(value), decryptString: (value) => value.toString() }
+      safeStorage: { isEncryptionAvailable: () => true, getSelectedStorageBackend: () => 'gnome_libsecret', encryptString: (value) => Buffer.from(value), decryptString: (value) => value.toString() }
     }
   })
   try {
@@ -384,6 +390,8 @@ test('pipeline preserves split JSON messages and protects the job identity', asy
   child.stdout = new PassThrough()
   child.stderr = new PassThrough()
   child.kill = () => true
+  let workerInput = ''
+  child.stdin.on('data', (chunk) => { workerInput += chunk.toString() })
   const sent = []
   const settings = { openrouterApiKey: 'test-secret', outputDirectory: '/tmp', pythonPath: 'python3', enginePath: '/tmp' }
   const runner = loadSource('pipeline-runner.ts', {
@@ -402,7 +410,8 @@ test('pipeline preserves split JSON messages and protects the job identity', asy
     './tools': { resolveBinary: () => '/staged/engine-bin/ffmpeg' }
   })
   const window = { isDestroyed: () => false, webContents: { isDestroyed: () => false, send: (channel, data) => sent.push({ channel, data }) } }
-  runner.startClipJob('trusted-job', { videoUrl: '/tmp/video.mp4' }, window)
+  runner.startClipJob('trusted-job', { videoUrl: '/tmp/video.mp4' }, window, undefined, '/tmp/queued-output')
+  assert.equal(JSON.parse(workerInput).output_dir, '/tmp/queued-output')
   child.stdout.write('{"type":"prog')
   child.stdout.write('ress","jobId":"spoof","percent":42}\n{"type":"result","status":"completed","job_id":"trusted-job","output":{"job_id":"trusted-job","clips":[]}}\n')
   child.stdout.end()
@@ -496,9 +505,11 @@ test('network policy rejects private literals and private DNS results', async ()
     './security': security,
     'dns/promises': { lookup: async (host) => [{ address: host === 'public.example' ? '93.184.216.34' : '10.0.0.1' }] }
   })
-  for (const address of ['127.0.0.1', '10.1.2.3', '169.254.169.254', '192.168.1.1', '::1', '::ffff:127.0.0.1', 'fc00::1']) assert.equal(policy.isPublicAddress(address), false)
-  assert.equal(policy.isPublicAddress('8.8.8.8'), true)
-  assert.equal(policy.isPublicAddress('2606:4700::1111'), true)
+  for (const address of ['127.0.0.1', '10.1.2.3', '169.254.169.254', '192.168.1.1', '::1', '::ffff:127.0.0.1', 'fc00::1',
+    '2002:c000:0204::1', '2001::1', '2001:1::1', '2001:2::1', '2001:10::1', '2001:2f::1', '2001:db8::1', '3fff::1']) assert.equal(policy.isPublicAddress(address), false, address)
+  for (const address of ['8.8.8.8', '2606:4700::1111', '2001:4860:4860::8888', '2001:470:1f0b::1', '2001:0db9:0000:0000:0000:0000:0000:0001']) {
+    assert.equal(policy.isPublicAddress(address), true, address)
+  }
   for (const url of ['http://localhost', 'http://127.0.0.1', 'http://[::1]', 'http://internal.example']) await assert.rejects(() => policy.assertPublicWebUrl(url))
   await policy.assertPublicWebUrl('https://public.example/video')
 })
@@ -550,4 +561,32 @@ test('cancellation retains a live process group after the leader closes and forc
   assert.deepEqual(signals, [{ pid: -12345, signal: 'SIGTERM' }, { pid: -12345, signal: 'SIGKILL' }])
   assert.equal(runner.hasActiveJobs(), false)
   assert.equal(sent.length, 0)
+})
+
+test('crash logs keep safe diagnostics without leaking credentials from errors', () => {
+  const lines = []
+  const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-log-test-'))
+  const { logger, errorSummary } = loadSource('logger.ts', {
+    electron: { app: { getPath: () => logDir } },
+    fs: { ...fs, appendFileSync: (_file, line) => lines.push(JSON.parse(line)) }
+  }, { console: { log() {}, warn() {}, error() {} } })
+  const error = new Error('Authorization: Bearer sk-or-v1-secretcredential on /Users/dev/Library/clip.mp4')
+  error.code = 'ENOENT'
+  error.stack = `Error: ${error.message}\n    at sk-or-v1-secretcredential (/Users/dev/app/out/main/index.js:42:13)`
+  logger.error('main.uncaughtException', errorSummary(error))
+  const entry = lines[0]
+  assert.equal(entry.name, 'Error')
+  assert.equal(entry.code, 'ENOENT')
+  assert.equal(entry.frame, 'main.index.js:42')
+  assert.equal(errorSummary('plain rejection').name, 'Error')
+  const malicious = new Error('API key sk-or-v1-secretcredential')
+  malicious.name = 'sk-or-v1-secretcredential'
+  malicious.code = 'sk-or-v1-secretcredential'
+  malicious.stack = 'Error\n    at sk-or-v1-secretcredential (/Users/sk-or-v1-secretcredential/secrets.js:1:2)'
+  logger.error('main.unhandledRejection', errorSummary(malicious))
+  assert.equal(lines[1].name, 'Error')
+  assert.equal(lines[1].code, '')
+  assert.equal(lines[1].frame, '')
+  assert.doesNotMatch(JSON.stringify(lines), /sk-or-v1-secretcredential|\/Users\/dev/)
+  fs.rmSync(logDir, { recursive: true, force: true })
 })

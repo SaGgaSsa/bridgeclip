@@ -60,6 +60,56 @@ test('library clips can be copied to a bank only from their saved run', async ()
   } finally { cleanup() }
 })
 
+test('automation imports require prior media authorization for files outside the library', async () => {
+  const { dir, cleanup } = tempDir('bridgeclip-bank-authorization-')
+  try {
+    const library = path.join(dir, 'library')
+    const outside = path.join(dir, 'private.mp4')
+    fs.mkdirSync(library)
+    fs.writeFileSync(outside, 'private media')
+    const main = loadMain("export * as automations from './src/main/automations'; export * as settings from './src/main/settings-store'; export * as security from './src/main/security'", { electron: fakeElectron(dir).electron })
+    main.settings.replaceApiKey('zernioApiKey', KEY)
+    main.settings.savePublicSettings({ outputDirectory: library, pythonPath: 'python3', customVocabulary: '' })
+    const [automation] = main.automations.createAutomation('Authorized imports')
+
+    await assert.rejects(main.automations.addAutomationContent(automation.id, [outside]), /outside the library/)
+    assert.equal(main.automations.listAutomations()[0].content.length, 0)
+    main.security.authorizeMedia(outside)
+    await main.automations.addAutomationContent(automation.id, [outside])
+    assert.equal(main.automations.listAutomations()[0].content.length, 1)
+  } finally { cleanup() }
+})
+
+test('a key switch during an automation import cannot overwrite the old workspace', async () => {
+  const { dir, cleanup } = tempDir('bridgeclip-bank-key-switch-')
+  try {
+    const library = path.join(dir, 'library')
+    fs.mkdirSync(library)
+    const clip = path.join(library, 'clip.mp4')
+    fs.writeFileSync(clip, 'clip bytes')
+    const main = loadMain("export * as automations from './src/main/automations'; export * as settings from './src/main/settings-store'; export { workspaceId } from './src/main/zernio/workspace-cache'", { electron: fakeElectron(dir).electron })
+    main.settings.savePublicSettings({ outputDirectory: library, pythonPath: 'python3', customVocabulary: '' })
+    main.settings.replaceApiKey('zernioApiKey', 'old-workspace-key')
+    const [oldAutomation] = main.automations.createAutomation('Old workspace')
+    const oldFile = path.join(dir, 'userData', `automations-${main.workspaceId('old-workspace-key')}.json`)
+    const oldContents = fs.readFileSync(oldFile, 'utf8')
+
+    const pendingImport = main.automations.addAutomationContent(oldAutomation.id, [clip])
+    main.settings.replaceApiKey('zernioApiKey', 'new-workspace-key')
+    const [newAutomation] = main.automations.createAutomation('New workspace')
+    const newFile = path.join(dir, 'userData', `automations-${main.workspaceId('new-workspace-key')}.json`)
+    const newContents = fs.readFileSync(newFile, 'utf8')
+
+    await assert.rejects(pendingImport, /workspace changed|Automation changed/)
+    assert.equal(fs.readFileSync(oldFile, 'utf8'), oldContents)
+    assert.equal(fs.readFileSync(newFile, 'utf8'), newContents)
+    main.settings.replaceApiKey('zernioApiKey', 'old-workspace-key')
+    assert.equal(main.automations.listAutomations()[0].id, oldAutomation.id)
+    main.settings.replaceApiKey('zernioApiKey', 'new-workspace-key')
+    assert.equal(main.automations.listAutomations()[0].id, newAutomation.id)
+  } finally { cleanup() }
+})
+
 test('an upload failure keeps an automation clip retryable without creating a post', async () => {
   const { dir, cleanup } = tempDir('bridgeclip-automation-upload-')
   const posting = createPostingMock()
@@ -288,8 +338,11 @@ test('AI automation transcribes the bank clip and sends distinct grounded metada
       assert.equal(ctx.req.headers.authorization, 'Bearer test-openrouter-key')
       assert.equal(ctx.req.headers['xi-api-key'], undefined)
       assert.equal(ctx.body.model, 'microsoft/mai-transcribe-2')
-      assert.equal(ctx.body.input_audio.format, 'm4a')
-      assert.ok(Buffer.from(ctx.body.input_audio.data, 'base64').length > 0)
+      assert.equal(ctx.body.response_format, 'verbose_json')
+      assert.equal(ctx.body.input_audio.format, 'wav')
+      const audio = Buffer.from(ctx.body.input_audio.data, 'base64')
+      assert.equal(audio.toString('ascii', 0, 4), 'RIFF')
+      assert.equal(audio.toString('ascii', 8, 12), 'WAVE')
       ctx.json(200, { text: transcript })
     } },
     { method: 'POST', path: '/chat/completions', auth: false, handler: (ctx) => ctx.json(200, { choices: [{ message: { content: JSON.stringify(metadata) } }] }) }

@@ -83,6 +83,19 @@ test('hydrate shows cached accounts at once and restores a pending sign-in', asy
   assert.equal(s.state().error.kind, 'offline')
 })
 
+test('a profile left behind after an access denial stays selected for recovery', async () => {
+  const s = load({ cached: overview([]) })
+  await s.state().hydrate()
+  const id = 'c'.repeat(24)
+  s.zernio.nextConnect = { status: 'failed', platform: 'youtube', profileId: id, createdProfile: { id, name: 'New brand' }, error: { kind: 'auth', message: 'Update the key in Settings.' } }
+  await s.state().connect('youtube', { newProfileName: 'New brand' })
+  assert.equal(s.state().profileId, id)
+  assert.equal(s.state().profiles.filter((p) => p.id === id).length, 1)
+  assert.equal(s.state().notice.action, 'settings')
+  assert.equal(s.state().notice.tone, 'danger')
+  assert.equal(s.state().connecting, null)
+})
+
 test('concurrent loads share one request', async () => {
   const s = load()
   const gate = deferred()
@@ -232,6 +245,27 @@ test('a disconnect result from an old workspace is discarded after a key change'
   assert.equal(s.state().loaded, false)
   assert.equal(s.state().notice, null)
   assert.equal(s.state().disconnecting, null)
+})
+
+test('a sync started before disconnect cannot restore the removed account', async () => {
+  const s = load()
+  const old = overview([account('1', 'tiktok')])
+  s.queueSync({ overview: old, stale: false, error: null })
+  await s.state().load()
+
+  const staleSync = deferred()
+  s.queueSync(() => staleSync.promise)
+  const pendingSync = s.state().load()
+  s.zernio.disconnect = async () => {}
+  s.queueSync({ overview: overview([]), stale: false, error: null })
+  await s.state().disconnect(account('1', 'tiktok').id)
+  assert.equal(s.state().accounts.length, 0)
+
+  staleSync.resolve({ overview: old, stale: false, error: null })
+  await pendingSync
+  await flush()
+  assert.equal(s.state().accounts.length, 0)
+  assert.equal(s.calls.sync, 3, 'a fresh sync follows the stale in-flight request')
 })
 
 test('focus fallback: a new account on refresh completes the sign-in without the redirect', async () => {
