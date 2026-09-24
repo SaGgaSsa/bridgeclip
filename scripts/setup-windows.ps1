@@ -187,6 +187,45 @@ if (-not $SkipNode) {
   } finally {
     Pop-Location
   }
+
+  # 6b. Electron development runtime binary (required for `npm run dev`).
+  # electron@44.x ships a JS wrapper without an npm postinstall hook, so a
+  # fresh `npm ci` can finish without dist/electron.exe. Download it here.
+  Write-Step 'Verifying Electron development runtime binary'
+  $ElectronDir = Join-Path $RepoRoot 'node_modules\electron'
+  $ElectronPathFile = Join-Path $ElectronDir 'path.txt'
+  $ElectronInstallJs = Join-Path $ElectronDir 'install.js'
+  $ElectronDistExe = Join-Path $ElectronDir 'dist\electron.exe'
+  $ElectronReady = ((Test-Path -LiteralPath $ElectronPathFile) -and (Test-Path -LiteralPath $ElectronDistExe))
+  if ($ElectronReady) {
+    Write-Info "Found Electron runtime: $ElectronDistExe"
+  } else {
+    Write-Info 'Electron binary missing (node_modules\electron\path.txt and/or dist\electron.exe absent); downloading via node node_modules\electron\install.js ...'
+    if (-not (Test-Path -LiteralPath $ElectronInstallJs)) {
+      Fail 'Electron install script was not found at node_modules\electron\install.js after `npm ci`. Delete node_modules and rerun this script; if it persists, check the `electron` devDependency and npm output above.'
+    }
+    if (-not (Test-AppCommand 'node')) {
+      Fail 'node was not found on PATH, so the Electron binary could not be downloaded. Install Node.js 22 and rerun this script.'
+    }
+    Push-Location -LiteralPath $RepoRoot
+    try {
+      & node "$ElectronInstallJs"
+      if ((-not $?) -or ($LASTEXITCODE -ne 0)) {
+        Fail "The Electron binary download failed (node node_modules\electron\install.js exited with code $LASTEXITCODE). Check your network/proxy, rerun this script, or run node node_modules\electron\install.js manually from the repo root."
+      }
+    } catch {
+      Fail "Could not run the Electron installer (node node_modules\electron\install.js). Error: $($_.Exception.Message)"
+    } finally {
+      Pop-Location
+    }
+    if (-not (Test-Path -LiteralPath $ElectronPathFile)) {
+      Fail 'Electron install finished but node_modules\electron\path.txt is still missing. Run `node node_modules\electron\install.js` manually from the repo root and rerun this script.'
+    }
+    if (-not (Test-Path -LiteralPath $ElectronDistExe)) {
+      Fail 'Electron install finished but node_modules\electron\dist\electron.exe is still missing. Run `node node_modules\electron\install.js` manually from the repo root and rerun this script (check antivirus/quarantine if the exe disappears).'
+    }
+    Write-Info "Installed Electron runtime: $ElectronDistExe"
+  }
 }
 
 Write-Host ''
