@@ -23,8 +23,8 @@
 
 ## Why BridgeClip?
 
-- **No BridgeMind account or backend.** BridgeClip runs on your machine and calls OpenRouter directly with your own provider accounts and keys. Optional social account connections use your Zernio account and API key. Your videos and keys do not pass through a BridgeMind server.
-- **Pay only for what you use.** Transcription and clip planning bill your OpenRouter account at their prices. Rendering happens locally with FFmpeg. BridgeClip shows estimated API cost when the providers return usable usage data.
+- **No BridgeMind account or backend.** BridgeClip runs on your machine and calls your configured providers directly with your own keys and logins. By default that is local faster-whisper transcription plus the OpenCode CLI planner; OpenRouter is optional for its economy/quality transcription and planning paths. Optional social account connections use your Zernio account and API key. Your videos and keys do not pass through a BridgeMind server.
+- **Pay only for what you use.** The default local faster-whisper transcription runs on your computer; the default OpenCode planner runs through your OpenCode login and its configured model, which may bill or log through that service. OpenRouter transcription and clip planning bill your OpenRouter account at their prices when you select them. Rendering happens locally with FFmpeg. BridgeClip shows estimated API cost when the providers return usable usage data.
 - **Captions that look native.** Nine styles (Viral, Hormozi, Bold, Clean, Minimal, Fire, Glow, Neon, Karaoke), each with a live preview before you render.
 - **MIT licensed.** Fork it, change it, ship it.
 
@@ -32,18 +32,23 @@
 
 ```
  Source video ──▶ Download ──▶ Transcribe ──▶ Find moments ──▶ Render
- (file or link)    yt-dlp      OpenRouter      OpenRouter        FFmpeg
-                           MAI Transcribe 2    LLM ranks the     crop, captions,
-                               word timings    best moments      one file per clip
+ (file or link)    yt-dlp      local faster-    OpenCode CLI     FFmpeg
+                               whisper          planner ranks    crop, captions,
+                               (default)        the best         one file per clip
+                                                moments
+                           OpenRouter alternative: MAI Transcribe 2 / Whisper
+                           Turbo transcription and LLM moment ranking,
+                           with economy (z-ai/glm-5.3-flash, no vision) and
+                           quality paths.
 ```
 
 Every run gets its own folder. The **Library** shows completed clips with virality scores, timecodes and tags. **Jobs** shows what is running or queued right now (up to two clipping runs go at once; more wait in a queue) and every earlier run, including completed, failed, cancelled and interrupted jobs; completed runs open their clips, and failed runs from this session can run again. Older runs without a saved status appear as unfinished. You can optionally connect social accounts through Zernio to publish or schedule a selected clip.
 
 ## Download
 
-Signed macOS builds for Apple silicon and Intel will appear on [Releases](https://github.com/bridge-mind/bridgeclip/releases) after release testing. Those builds bundle Python, FFmpeg and yt-dlp. Until then, use the development setup below. Windows source builds are experimental and are not part of the supported release workflow.
+Signed macOS builds for Apple silicon and Intel will appear on [Releases](https://github.com/bridge-mind/bridgeclip/releases) after release testing. Those builds bundle Python, FFmpeg and yt-dlp. Until then, use the development setup below. Windows runs only from a terminal via `npm run dev` from source; there is no installer or exe requirement and none is provided here. Windows source builds are experimental and are not part of the supported release workflow.
 
-On first launch, paste your OpenRouter key into the setup card:
+On first launch, the default local path needs no OpenRouter key: sign in the OpenCode CLI with an available model and make sure local transcription is ready in **Settings → System check**. Add an OpenRouter key in the setup card only if you select OpenRouter transcription/planning or enable the optional AI vision check:
 
 | Provider | Used for | Get a key |
 | --- | --- | --- |
@@ -53,7 +58,7 @@ Keys are encrypted with your operating system's secure storage. If secure storag
 
 ### What leaves your computer
 
-For a link, the app downloads the source using your network connection. Audio for MAI Transcribe 2 (Quality) or Whisper Turbo (Economy) transcription goes to OpenRouter. Transcription retries temporary failures and uses fallback models when needed; Economy tries Whisper Large V3 before MAI. Transcript text for clip planning also goes to OpenRouter. If the video has no audio or no speech, BridgeClip samples video frames and sends those images to OpenRouter for visual-only planning. Clips made through that fallback have no speech captions. Economy skips optional AI layout checks. If you connect social accounts, BridgeClip sends your Zernio API key to Zernio and receives account/profile metadata; platform sign-in occurs in your browser. When you choose **Post** or **Schedule**, BridgeClip uploads that clip to Zernio's media storage and sends its caption, selected accounts and publishing options to Zernio. Zernio then publishes to those platforms. Provider accounts, charges, retention and data policies are governed by those services.
+For a link, the app downloads the source using your network connection. Default local transcription with faster-whisper runs on your computer and does not send audio to OpenRouter. The default OpenCode planner runs locally through the OpenCode CLI, but it may send transcript text to its configured service; check that service's data policy. Local transcription does not mean transcript text stays on this PC. If you instead select OpenRouter providers: audio for MAI Transcribe 2 (Quality) or Whisper Turbo (Economy) transcription goes to OpenRouter. Transcription retries temporary failures and uses fallback models when needed; Economy tries Whisper Large V3 before MAI and uses z-ai/glm-5.3-flash planning with no vision fallback. Transcript text for OpenRouter clip planning also goes to OpenRouter. On the OpenRouter path, if the video has no audio or no speech, BridgeClip samples video frames and sends those images to OpenRouter for visual-only planning; clips made through that fallback have no speech captions. The default local OpenCode planner has no vision model and needs a transcript, so speechless videos fail there instead. Economy skips optional AI layout checks. The optional AI vision check improves ambiguous layouts and can add OpenRouter cost. If you connect social accounts, BridgeClip sends your Zernio API key to Zernio and receives account/profile metadata; platform sign-in occurs in your browser. When you choose **Post** or **Schedule**, BridgeClip uploads that clip to Zernio's media storage and sends its caption, selected accounts and publishing options to Zernio. Zernio then publishes to those platforms. Provider accounts, charges, retention and data policies are governed by those services.
 
 Downloads and intermediate media are held in a private `work/` directory under BridgeClip’s per-user application data folder. BridgeClip removes job work on completion, failure, and cancellation, and clears stale work when it next starts after a forced shutdown. A local video you selected stays where it was. Rendered clips, the transcript, plan and `job_output.json` remain in a run folder under your chosen **Output folder** (by default, `~/BridgeClip`). That JSON includes the source URL or local path and video title. Delete the run folder to remove those local outputs.
 
@@ -69,7 +74,7 @@ Live channels, Twitch clips, collections, subscriber-only videos and deleted or 
 
 ## Develop
 
-**Prerequisites:** Node.js 22, Python 3.12, and FFmpeg with the libass-backed `ass` filter for captions. The clipping engine, model, fonts, and locked Python dependencies are included in this repository. In development, BridgeClip uses FFmpeg from `engine-bin/` when it exists, then falls back to your `PATH`. Provider keys are needed for live jobs, not tests.
+**Prerequisites:** Node.js 22, Python 3.12, and FFmpeg with the libass-backed `ass` filter for captions. The clipping engine, model, fonts, and locked Python dependencies are included in this repository. In development, BridgeClip uses FFmpeg from `engine-bin/` when it exists, then falls back to your `PATH`. An OpenRouter key is only needed for live jobs that select OpenRouter providers or vision, not for the default local faster-whisper + OpenCode path and not for tests.
 
 ```bash
 git clone https://github.com/bridge-mind/bridgeclip
@@ -82,7 +87,7 @@ npm run dev
 
 ### Windows 10/11 (run from source)
 
-Windows source builds are experimental; run them from source with `npm run dev`. Windows distributable packaging (NSIS) is not verified, and resource staging is currently macOS-only.
+Windows source builds are experimental; run them only from a terminal via `npm run dev`. There is no installer or exe to download and none is required. Windows distributable packaging (NSIS) is not verified, and resource staging is currently macOS-only.
 
 **Prerequisites (x64):** Python 3.12, FFmpeg and FFprobe with the libass-backed `ass` filter (for example a full build from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) or [BtbN](https://github.com/BtbN/FFmpeg-Builds)) on `PATH`, Node.js 22, and the [OpenCode CLI](https://opencode.ai/) signed in with an available model for the default local planner.
 
@@ -107,9 +112,9 @@ The release workflow packages the in-repo engine and media tools into signed mac
 
 ### First run and troubleshooting
 
-1. Add your OpenRouter key in the setup card. A saved key is never shown again; paste a new one to replace it or choose **Remove key** in Settings.
-2. Run **Settings → System check**. In development, set the Python path if your local virtual environment is not detected.
-3. Choose a local video with the file picker or paste a public video link, select clip lengths, framing, and caption style, then start. Smart framing automatically follows faces and arranges screen shares with facecams shot by shot. The optional AI vision check improves ambiguous layouts and can add OpenRouter cost. Dropping a local file opens the picker so you can grant access. Completed runs appear in Library and in your output folder.
+1. Sign in the OpenCode CLI with an available model for the default local planner; no OpenRouter key is needed for that path. If you select OpenRouter transcription/planning or enable vision, add your OpenRouter key in the setup card instead. A saved key is never shown again; paste a new one to replace it or choose **Remove key** in Settings.
+2. Run **Settings → System check**. It verifies local faster-whisper, the OpenCode CLI, Python, yt-dlp, FFmpeg, and the engine. In development, set the Python path if your local virtual environment is not detected.
+3. Choose a local video with the file picker or paste a public video link (YouTube or a public, completed Twitch VOD), select clip lengths, framing, caption style, and economy/quality, then start. Smart framing automatically follows faces and arranges screen shares with facecams shot by shot. The optional AI vision check improves ambiguous layouts and can add OpenRouter cost. Dropping a local file opens the picker so you can grant access. Completed runs appear in Library and in your output folder.
 4. If a link fails, check it in a signed-out browser or download it yourself and select the local file. If a run fails, use the in-app error and System check first; logs intentionally omit raw provider responses and private source details.
 
 | Script | What it does |

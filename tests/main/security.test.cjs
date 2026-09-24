@@ -22,6 +22,37 @@ function loadShared(file) {
 }
 const TEST_WORK_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-worker-test-'))
 process.on('exit', () => fs.rmSync(TEST_WORK_HOME, { recursive: true, force: true }))
+
+/**
+ * Windows without Developer Mode/elevated privileges fails `fs.symlinkSync`
+ * with EPERM/ENOTSUP/EACCES. Skip only the fixture setup in that case, never
+ * after the operation under test, so POSIX keeps the symlink security checks.
+ */
+function symlinkOrSkip(t, target, linkPath) {
+  try {
+    fs.symlinkSync(target, linkPath)
+    return true
+  } catch (error) {
+    if (error && (error.code === 'EPERM' || error.code === 'ENOTSUP' || error.code === 'EACCES')) {
+      t.skip(`Symlink fixture requires privileges unavailable on this machine (${error.code}).`)
+      return false
+    }
+    throw error
+  }
+}
+
+/**
+ * POSIX private-file mode bits (0o077) are not implemented on Windows.
+ * Keep the mode assertion on POSIX; on Windows assert the file exists, while
+ * each caller keeps its safe-content assertions.
+ */
+function assertPrivateFileMode(file) {
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(file).mode & 0o077, 0)
+  } else {
+    assert.ok(fs.existsSync(file), 'expected private file to exist')
+  }
+}
 const jobContract = loadShared('job-contract.ts')
 const jobOutput = loadShared('job-output.ts')
 const videoSource = loadShared('video-source.ts')
@@ -31,7 +62,7 @@ const { validateJobConfig } = loadSource('validation.ts', { './security': securi
 
 test('development checks the staged FFmpeg that the clipping engine uses', async () => {
   const binDir = path.join(__dirname, '../../engine-bin')
-  const ffmpeg = path.join(binDir, 'ffmpeg')
+  const ffmpeg = path.join(binDir, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')
   const invoked = []
   const execFile = () => {}
   execFile[require('node:util').promisify.custom] = async (command) => {
@@ -75,7 +106,7 @@ test('Zernio sign-in links stay on its HTTPS origin and provider errors are sani
     error.message.includes('HTTP 500') && !error.message.includes('private-provider-token'))
 })
 
-test('media authorization rejects traversal, symlink escapes, and non-media files', () => {
+test('media authorization rejects traversal, symlink escapes, and non-media files', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-test-'))
   try {
     const library = path.join(root, 'library')
@@ -86,7 +117,7 @@ test('media authorization rejects traversal, symlink escapes, and non-media file
     fs.writeFileSync(video, '')
     fs.writeFileSync(outside, '')
     fs.writeFileSync(secret, '{}')
-    fs.symlinkSync(outside, path.join(library, 'escape.mp4'))
+    if (!symlinkOrSkip(t, outside, path.join(library, 'escape.mp4'))) return
     assert.doesNotThrow(() => security.assertMediaPath(video, library))
     assert.throws(() => security.assertMediaPath(outside, library))
     assert.throws(() => security.assertMediaPath(path.join(library, 'escape.mp4'), library))
@@ -100,7 +131,7 @@ test('media authorization rejects traversal, symlink escapes, and non-media file
   } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })
 
-test('validated media handle keeps the authorized file after its pathname changes', async () => {
+test('validated media handle keeps the authorized file after its pathname changes', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-media-handle-'))
   try {
     const library = path.join(root, 'library')
@@ -111,7 +142,10 @@ test('validated media handle keeps the authorized file after its pathname change
     fs.writeFileSync(outside, 'untrusted')
     const opened = await security.openAuthorizedMedia(video, library)
     fs.renameSync(video, path.join(library, 'old.mp4'))
-    fs.symlinkSync(outside, video)
+    if (!symlinkOrSkip(t, outside, video)) {
+      await opened.handle.close()
+      return
+    }
     try {
       assert.equal(await opened.handle.readFile('utf-8'), 'authorized')
     } finally { await opened.handle.close() }
@@ -119,7 +153,7 @@ test('validated media handle keeps the authorized file after its pathname change
   } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })
 
-test('thumbnail generation uses a private cache and does not follow an adjacent symlink', async () => {
+test('thumbnail generation uses a private cache and does not follow an adjacent symlink', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-thumb-'))
   try {
     const video = path.join(root, 'clip.mp4')
@@ -128,7 +162,7 @@ test('thumbnail generation uses a private cache and does not follow an adjacent 
     const userData = path.join(root, 'user-data')
     fs.writeFileSync(video, 'video')
     fs.writeFileSync(outside, 'keep')
-    fs.symlinkSync(outside, adjacent)
+    if (!symlinkOrSkip(t, outside, adjacent)) return
     fs.mkdirSync(userData)
     const manager = loadSource('file-manager.ts', {
       electron: { app: { getPath: () => userData } },
@@ -158,7 +192,7 @@ test('IPC authentication requires the registered window main frame', () => {
   assert.throws(() => security.assertTrustedSender({ sender: contents, senderFrame: frame }, null))
 })
 
-test('the native picker authorizes media and shell opening rejects aliased application bundles', async () => {
+test('the native picker authorizes media and shell opening rejects aliased application bundles', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-picker-'))
   try {
     const library = path.join(root, 'library')
@@ -200,7 +234,7 @@ test('the native picker authorizes media and shell opening rejects aliased appli
     const bundle = path.join(library, 'unsafe.app')
     fs.mkdirSync(bundle)
     const alias = path.join(library, 'ordinary-folder')
-    fs.symlinkSync(bundle, alias)
+    if (!symlinkOrSkip(t, bundle, alias)) return
     await assert.rejects(handlers.get('shell:openPath')({ sender: contents, senderFrame: frame }, alias), /Application bundles cannot be opened/)
   } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })
@@ -291,11 +325,12 @@ test('settings migration writes a private file', () => {
   })
   try {
     assert.equal(store.loadSettings().openrouterApiKey, 'old-key')
-    assert.equal(fs.statSync(path.join(userData, 'settings.json')).mode & 0o077, 0)
+    assertPrivateFileMode(path.join(userData, 'settings.json'))
+    assert.equal(JSON.parse(fs.readFileSync(path.join(userData, 'settings.json'), 'utf8')).openrouterApiKey.scheme, 'safeStorage')
   } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })
 
-test('library rejects parseable but incomplete job output', async () => {
+test('library rejects parseable but incomplete job output', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-library-'))
   const run = path.join(root, 'run-one')
   fs.mkdirSync(run)
@@ -309,7 +344,7 @@ test('library rejects parseable but incomplete job output', async () => {
     const outside = path.join(root, 'outside.json')
     fs.writeFileSync(outside, JSON.stringify({ job_id: 'outside', clips: [] }))
     fs.rmSync(path.join(run, 'job_output.json'))
-    fs.symlinkSync(outside, path.join(run, 'job_output.json'))
+    if (!symlinkOrSkip(t, outside, path.join(run, 'job_output.json'))) return
     assert.equal(await manager.getJobOutput(run), null)
     assert.equal((await manager.getJobHistory(root))[0].status, 'failed')
   } finally { fs.rmSync(root, { recursive: true, force: true }) }
@@ -330,7 +365,7 @@ test('library retains unfinished desktop runs and ignores unrelated folders', as
   } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })
 
-test('run history persists outcomes, identifies interrupted work, and omits source query data', async () => {
+test('run history persists outcomes, identifies interrupted work, and omits source query data', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-history-'))
   const failedId = '4de005c2-1234-4123-8123-567890abcdef'
   const runningId = '4de005c3-1234-4123-8123-567890abcdef'
@@ -341,7 +376,7 @@ test('run history persists outcomes, identifies interrupted work, and omits sour
     const raw = fs.readFileSync(path.join(root, failedId, 'run-history.json'), 'utf8')
     assert.equal(raw.includes('private-query'), false)
     assert.equal(raw.includes('abc123def45'), true)
-    assert.equal(fs.statSync(path.join(root, failedId, 'run-history.json')).mode & 0o077, 0)
+    assertPrivateFileMode(path.join(root, failedId, 'run-history.json'))
     runHistory.finishRunRecord(root, failedId, 'failed', 'Audio transcription failed.')
     runHistory.createRunRecord(root, runningId, '/tmp/local-video.mp4')
     runHistory.createRunRecord(root, cancelledId, '/tmp/cancelled.mp4')
@@ -357,7 +392,7 @@ test('run history persists outcomes, identifies interrupted work, and omits sour
     const outside = path.join(root, 'outside.json')
     fs.writeFileSync(outside, raw)
     fs.rmSync(path.join(root, failedId, 'run-history.json'))
-    fs.symlinkSync(outside, path.join(root, failedId, 'run-history.json'))
+    if (!symlinkOrSkip(t, outside, path.join(root, failedId, 'run-history.json'))) return
     assert.equal(runHistory.readRunRecord(root, failedId), null)
   } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })
@@ -377,7 +412,7 @@ test('diagnostic logs omit source URLs and use private file permissions', () => 
     assert.equal(log.includes('dummy'), false)
     assert.equal(JSON.parse(log).failureCode, 'transcription.bad_request')
     assert.equal(JSON.parse(log).httpStatus, 400)
-    assert.equal(fs.statSync(loggerModule.getLogFilePath()).mode & 0o077, 0)
+    assertPrivateFileMode(loggerModule.getLogFilePath())
   } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })
 
@@ -589,4 +624,28 @@ test('crash logs keep safe diagnostics without leaking credentials from errors',
   assert.equal(lines[1].frame, '')
   assert.doesNotMatch(JSON.stringify(lines), /sk-or-v1-secretcredential|\/Users\/dev/)
   fs.rmSync(logDir, { recursive: true, force: true })
+})
+
+test('explicit opencode.cmd resolves on Windows PATH without a shell', () => {
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-opencode-'))
+  try {
+    const launcher = path.join(binDir, 'opencode.cmd')
+    fs.writeFileSync(launcher, '@echo off\n')
+    const winProcess = {
+      ...process,
+      platform: 'win32',
+      env: { ...process.env, PATH: binDir, PATHEXT: '.COM;.EXE;.BAT;.CMD' }
+    }
+    const winTools = loadSource('tools.ts', {
+      electron: { app: { isPackaged: false } },
+      fs,
+      child_process: require('node:child_process')
+    }, { process: winProcess })
+    assert.equal(winTools.resolveOpencodeCommand('opencode.cmd'), launcher)
+    assert.equal(winTools.isOpencodeAvailable('opencode.cmd'), true)
+    // Command validation and no-shell resolution are preserved.
+    assert.equal(winTools.resolveOpencodeCommand('opencode; rm -rf /'), null)
+    assert.equal(winTools.resolveOpencodeCommand('opencode --model x'), null)
+    assert.equal(winTools.resolveOpencodeCommand('opencode|evil'), null)
+  } finally { fs.rmSync(binDir, { recursive: true, force: true }) }
 })

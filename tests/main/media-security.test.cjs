@@ -22,6 +22,19 @@ function clip(file) {
   execFileSync(FFMPEG, ['-v', 'error', '-f', 'lavfi', '-i', 'color=s=64x64:d=0.3', '-f', 'lavfi', '-i', 'sine=duration=0.3', '-shortest', '-c:v', 'mpeg4', '-c:a', 'aac', file])
 }
 
+function symlinkOrSkip(t, target, linkPath) {
+  try {
+    fs.symlinkSync(target, linkPath)
+    return true
+  } catch (error) {
+    if (error && (error.code === 'EPERM' || error.code === 'ENOTSUP' || error.code === 'EACCES')) {
+      t.skip(`Symlink fixture requires privileges unavailable on this machine (${error.code}).`)
+      return false
+    }
+    throw error
+  }
+}
+
 test('a playlist disguised as video cannot read sibling media or generate a thumbnail', async () => {
   const { dir, cleanup } = tempDir()
   const oldFetch = global.fetch
@@ -93,14 +106,14 @@ test('a bad OpenRouter request is not reported as a credit failure', async () =>
   } finally { global.fetch = oldFetch; cleanup() }
 })
 
-test('post cache writes do not follow predictable temporary-file symlinks', () => {
+test('post cache writes do not follow predictable temporary-file symlinks', (t) => {
   const { dir, cleanup } = tempDir()
   try {
     const { PostsStore } = loadMain("export { PostsStore } from './src/main/zernio/posts-store'", { electron: fakeElectron(dir).electron })
     const cache = path.join(dir, 'posts.json')
     const victim = path.join(dir, 'unrelated.txt')
     fs.writeFileSync(victim, 'keep me')
-    fs.symlinkSync(victim, `${cache}.tmp`)
+    if (!symlinkOrSkip(t, victim, `${cache}.tmp`)) return
     new PostsStore(cache).save()
     assert.equal(fs.readFileSync(victim, 'utf8'), 'keep me')
   } finally { cleanup() }

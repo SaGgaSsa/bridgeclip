@@ -15,6 +15,16 @@ import bridge_runner as bridge
 
 
 class BridgeTests(unittest.TestCase):
+    def setUp(self):
+        # bridge.run() installs the production network guard, which globally
+        # patches sockets. In a joint Windows suite that blocks loopback and
+        # breaks asyncio event-loop creation for later tests, so neutralize it
+        # for in-process runs only. The real subprocess test below spawns a
+        # fresh interpreter and still executes the production guard.
+        patcher = patch("network_guard.install", lambda: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def config(self, **overrides):
         return {"contract_version": 1, "layout_vision_enabled": True, "job_id": "job-123", "video_url": "https://example.com/video", **overrides}
 

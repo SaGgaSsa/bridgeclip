@@ -25,7 +25,7 @@ function setup() {
   const cancelled = []
   const records = []
   const runner = {
-    startClipJob: (jobId, config, sink, onExit, outputDirectory) => starts.push({ jobId, config, sink, onExit, outputDirectory }),
+    startClipJob: (jobId, config, sink, onExit, runtime) => starts.push({ jobId, config, sink, onExit, runtime }),
     cancelJob: (jobId) => { cancelled.push(jobId); return true }
   }
   const manager = loadModule('main/job-manager.ts', {
@@ -73,8 +73,17 @@ test('queued jobs start in the output folder captured when they were enqueued', 
   enqueue('d', '/new-selection')
   starts[0].onExit()
   starts[1].onExit()
-  assert.deepEqual(starts.map((start) => start.outputDirectory),
+  assert.deepEqual(starts.map((start) => start.runtime.outputDirectory),
     ['/original', '/original', '/original', '/new-selection'])
+  // The fifth argument is a frozen JobRuntimeSnapshot, not a plain string:
+  // provider and key settings travel with the queued output folder.
+  for (const start of starts) {
+    assert.equal(typeof start.runtime, 'object')
+    assert.equal(typeof start.runtime.outputDirectory, 'string')
+  }
+  assert.equal(starts[0].runtime.transcriptionProvider, 'openrouter')
+  assert.equal(starts[0].runtime.plannerProvider, 'openrouter')
+  assert.equal(starts[0].runtime.openrouterApiKey, '')
 })
 
 test('runner events become snapshots with rising revisions, sent to the window open at the time', () => {

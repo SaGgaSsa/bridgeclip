@@ -73,6 +73,15 @@ export function resolveOpencodeCommand(command: string): string | null {
       ? (process.env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean)
       : ['']
   for (const dir of dirs) {
+    // An explicit filename already carrying an extension (e.g. `opencode.cmd`)
+    // must resolve when that file is on PATH. The PATHEXT loop below would
+    // otherwise only try `opencode.cmd.COM`, `opencode.cmd.EXE`, and so on.
+    if (process.platform === 'win32') {
+      const exact = join(dir, command)
+      try {
+        if (existsSync(exact)) return exact
+      } catch { /* Keep searching PATH. */ }
+    }
     for (const ext of extensions) {
       const candidate = join(dir, `${command}${process.platform === 'win32' && ext === '' ? '' : ext}`)
       try {
